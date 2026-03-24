@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+log.log
+gunicorn.ctl
+az
+*.md
+docker-compose.yml
+.env.example

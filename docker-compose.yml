@@ -1,0 +1,10 @@
+services:
+  azure-mapper:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - app/.env
+    environment:
+      FLASK_ENV: development
+    restart: unless-stopped

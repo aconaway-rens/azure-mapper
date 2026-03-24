@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Azure Mapper</title>
+    <script src="https://alcdn.msauth.net/browser/2.32.2/js/msal-browser.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background: #f5f5f5;
+        }
+
+        .container {
+            display: flex;
+            height: 100vh;
+        }
+
+        .sidebar {
+            width: 300px;
+            background: white;
+            border-right: 1px solid #ddd;
+            padding: 20px;
+            overflow-y: auto;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .header {
+            background: #0078d4;
+            color: white;
+            padding: 15px 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .header h1 {
+            font-size: 24px;
+            margin: 0;
+        }
+
+        #cy {
+            flex: 1;
+            background: #fafafa;
+        }
+
+        .section {
+            margin-bottom: 20px;
+        }
+
+        .section h3 {
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        select, input {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+
+        select:focus, input:focus {
+            outline: none;
+            border-color: #0078d4;
+            box-shadow: 0 0 0 3px rgba(0, 120, 212, 0.1);
+        }
+
+        button {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 8px;
+            background: #0078d4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #106ebe;
+        }
+
+        button:active {
+            background: #005fbf;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        .status {
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-bottom: 10px;
+            color: #666;
+        }
+
+        .status.loading {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .info-panel {
+            background: #f9f9f9;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+
+        .info-panel strong {
+            color: #0078d4;
+        }
+
+        .legend {
+            background: #f9f9f9;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+
+        .rg { background: #f0f0f0; border: 2px dashed #a0a0a0; }
+        .vnet { background: #e6f2ff; border: 2px dashed #0078d4; }
+        .subnet { background: #50e6ff; }
+        .peering { background: #107c10; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="sidebar">
+            <div class="section">
+                <h3>Azure Mapper</h3>
+                <div id="authStatus" class="status">Not signed in</div>
+                <button id="authBtn" onclick="signIn()">Sign In with Microsoft</button>
+                <div id="userName" style="display:none; font-size:12px; color:#333; margin-bottom:8px;"></div>
+            </div>
+
+            <div class="section">
+                <h3>Subscription</h3>
+                <select id="subscriptionSelect">
+                    <option value="">-- Load subscriptions --</option>
+                </select>
+                <button onclick="loadSubscriptions()">Load Subscriptions</button>
+                <div id="subStatus" class="status" style="display:none;"></div>
+            </div>
+
+            <div class="section">
+                <h3>Scan Resources</h3>
+                <button onclick="scanSubscription()" id="scanBtn">Scan Resources</button>
+                <div id="scanStatus" class="status" style="display:none;"></div>
+            </div>
+
+            <div class="section">
+                <h3>Graph Info</h3>
+                <div id="graphInfo" class="info-panel" style="display:none;">
+                    <strong>Subscription:</strong><br><span id="infoSub"></span><br><br>
+                    <strong>Nodes:</strong><br><span id="infoNodes">0</span><br><br>
+                    <strong>Edges:</strong><br><span id="infoEdges">0</span>
+                </div>
+            </div>
+
+            <div class="section">
+                <h3>Legend</h3>
+                <div class="legend">
+                    <div class="legend-item">
+                        <div class="legend-color rg"></div>
+                        <span>Resource Group</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color vnet"></div>
+                        <span>Virtual Network</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color subnet"></div>
+                        <span>Subnet</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color peering"></div>
+                        <span>Peering</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <button onclick="clearGraph()">Clear Graph</button>
+            </div>
+        </div>
+
+        <div class="main">
+            <div class="header">
+                <h1 id="diagramTitle">Azure Resource Topology</h1>
+            </div>
+            <div id="cy"></div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
