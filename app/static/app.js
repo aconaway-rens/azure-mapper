@@ -5,6 +5,7 @@
 let cy = null;
 let currentGraph = null;
 let msalInstance = null;
+let drillDownActive = false;
 
 // MSAL configuration
 const msalConfig = {
@@ -159,6 +160,7 @@ function initializeCytoscape() {
                 }
             },
             // Subnet: solid rounded rectangle inside VNet
+            // When it has children (drill-down), it becomes a compound node
             {
                 selector: 'node[type="subnet"]',
                 style: {
@@ -172,6 +174,21 @@ function initializeCytoscape() {
                     'color': '#000',
                     'text-wrap': 'wrap',
                     'text-max-width': '130px',
+                }
+            },
+            // Subnet when it has children (drill-down active)
+            {
+                selector: 'node[type="subnet"]:parent',
+                style: {
+                    'text-valign': 'top',
+                    'text-halign': 'center',
+                    'text-margin-y': -8,
+                    'font-size': 11,
+                    'font-weight': 'bold',
+                    'padding': '20px',
+                    'background-opacity': 0.5,
+                    'width': 'auto',
+                    'height': 'auto',
                 }
             },
             // Edges
@@ -199,6 +216,57 @@ function initializeCytoscape() {
                     'text-rotation': 'autorotate',
                 }
             },
+            // NIC nodes
+            {
+                selector: 'node[type="nic"]',
+                style: {
+                    'shape': 'roundrectangle',
+                    'background-color': '#ff8c00',
+                    'border-color': '#cc7000',
+                    'border-width': 1,
+                    'width': 140,
+                    'height': 40,
+                    'font-size': 9,
+                    'color': '#fff',
+                    'text-wrap': 'wrap',
+                    'text-max-width': '130px',
+                }
+            },
+            // VM container node (name at top)
+            {
+                selector: 'node[type="vm"]',
+                style: {
+                    'shape': 'roundrectangle',
+                    'background-color': '#8661c5',
+                    'border-color': '#6b4fa0',
+                    'border-width': 1,
+                    'text-valign': 'top',
+                    'text-halign': 'center',
+                    'text-margin-y': -6,
+                    'font-size': 11,
+                    'font-weight': 'bold',
+                    'color': '#fff',
+                    'padding': '10px',
+                    'background-opacity': 0.9,
+                }
+            },
+            // VM detail child (size, OS, IP)
+            {
+                selector: 'node[type="vm_detail"]',
+                style: {
+                    'shape': 'roundrectangle',
+                    'background-color': '#7451b0',
+                    'border-width': 0,
+                    'width': 160,
+                    'height': 40,
+                    'font-size': 8,
+                    'color': '#ddd',
+                    'text-wrap': 'wrap',
+                    'text-max-width': '150px',
+                    'text-valign': 'center',
+                    'text-halign': 'center',
+                }
+            },
             // Selected state
             {
                 selector: ':selected',
@@ -213,10 +281,10 @@ function initializeCytoscape() {
         layout: { name: 'preset' }
     });
 
-    // Add click handler for node inspection
-    cy.on('tap', 'node', function(evt) {
+    // Click a subnet to drill down into its resources
+    cy.on('tap', 'node[type="subnet"]', function(evt) {
         const node = evt.target;
-        console.log('Node selected:', node.data());
+        drillDownToSubnet(node);
     });
 }
 
@@ -416,6 +484,238 @@ async function renderGraph(subscriptionId) {
     } catch (e) {
         showStatus('scanStatus', `Render error: ${e.message}`, 'error');
     }
+}
+
+/**
+ * Drill down into a subnet to show NICs and VMs
+ */
+async function drillDownToSubnet(subnetNode) {
+    if (drillDownActive) return;
+
+    const subnetData = subnetNode.data();
+    const azureId = subnetData.azure_id;
+    const subscriptionId = document.getElementById('infoSub').textContent;
+
+    if (!azureId || !subscriptionId) return;
+
+    drillDownActive = true;
+
+    // Show detail panel
+    const detailSection = document.getElementById('detailSection');
+    detailSection.style.display = 'block';
+    showStatus('detailStatus', 'Loading resources...', 'loading');
+
+    // Update detail panel header
+    const detailPanel = document.getElementById('detailPanel');
+    detailPanel.innerHTML = `
+        <div class="detail-item">
+            <span class="detail-label">Subnet:</span> ${subnetData.label}
+        </div>
+    `;
+
+    try {
+        const res = await authFetch('/api/subnet/resources', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                subscription_id: subscriptionId,
+                subnet_azure_id: azureId,
+            })
+        });
+
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to fetch resources');
+
+        // Remove any previously added drill-down nodes
+        cy.nodes('[type="nic"]').remove();
+        cy.nodes('[type="vm"]').remove();
+        cy.edges('[type="attached_to"]').remove();
+
+        const subnetPos = subnetNode.position();
+        const vmNodes = [];
+
+        // Build a map of VM name -> list of NICs
+        const vmNicMap = {};
+        data.nics.forEach(function(nic) {
+            if (nic.vm_name) {
+                if (!vmNicMap[nic.vm_name]) vmNicMap[nic.vm_name] = [];
+                vmNicMap[nic.vm_name].push(nic);
+            }
+        });
+
+        // Create VM compound nodes with a detail child inside
+        data.vms.forEach(function(vm) {
+            const vmId = 'vm_' + vm.name;
+            const nics = vmNicMap[vm.name] || [];
+            const ips = nics.map(function(n) {
+                return n.private_ip || '?';
+            }).join(', ');
+
+            // VM container node (shows name at top)
+            vmNodes.push({
+                data: {
+                    id: vmId,
+                    label: vm.name,
+                    type: 'vm',
+                    parent: subnetNode.id(),
+                    vm_size: vm.vm_size,
+                    os_type: vm.os_type,
+                }
+            });
+
+            // Detail child node (shows size + IP inside)
+            let detailLines = [];
+            if (vm.vm_size) detailLines.push(vm.vm_size);
+            if (vm.os_type) detailLines.push(String(vm.os_type));
+            if (ips) detailLines.push(ips);
+
+            vmNodes.push({
+                data: {
+                    id: vmId + '_detail',
+                    label: detailLines.join('\n'),
+                    type: 'vm_detail',
+                    parent: vmId,
+                }
+            });
+        });
+
+        // Orphan NICs (no VM attached)
+        data.nics.forEach(function(nic) {
+            if (!nic.vm_name) {
+                vmNodes.push({
+                    data: {
+                        id: 'nic_' + nic.name,
+                        label: nic.name + '\n' + (nic.private_ip || ''),
+                        type: 'nic',
+                        parent: subnetNode.id(),
+                    }
+                });
+            }
+        });
+
+        // Add to graph
+        cy.add(vmNodes);
+
+        // Hide all nodes except the ancestors and siblings of this subnet
+        const parentVnet = subnetNode.parent();
+        const ancestors = subnetNode.ancestors();
+        cy.nodes().forEach(function(node) {
+            const type = node.data('type');
+            // Keep: the drilled subnet, its ancestors, and new VM/detail nodes
+            if (node.same(subnetNode) || ancestors.contains(node) ||
+                type === 'vm' || type === 'vm_detail' || type === 'nic') {
+                return;
+            }
+            // Keep siblings of the subnet (other subnets in same VNet)
+            if (node.parent() && node.parent().same(parentVnet) && type === 'subnet') {
+                node.style('opacity', 0.2);
+                return;
+            }
+            // Hide everything else
+            node.style('opacity', 0.15);
+        });
+        // Dim peering edges
+        cy.edges().style('opacity', 0.1);
+
+        // Highlight the active subnet
+        subnetNode.style('border-color', '#e8374a');
+        subnetNode.style('border-width', 3);
+
+        // Position VM nodes in a row
+        const vmOnlyNodes = cy.nodes('[type="vm"]');
+        const spacing = 220;
+        const count = vmOnlyNodes.length;
+        const totalW = (count - 1) * spacing;
+        vmOnlyNodes.forEach(function(node, i) {
+            node.position({
+                x: subnetPos.x - totalW / 2 + i * spacing,
+                y: subnetPos.y,
+            });
+        });
+
+        // Position orphan NICs after VMs
+        const orphanNics = cy.nodes('[type="nic"]');
+        orphanNics.forEach(function(node, i) {
+            node.position({
+                x: subnetPos.x - totalW / 2 + (count + i) * spacing,
+                y: subnetPos.y,
+            });
+        });
+
+        // Zoom to the subnet and its contents
+        const allDrillContent = subnetNode.union(subnetNode.descendants());
+        cy.animate({
+            fit: { eles: allDrillContent, padding: 80 },
+            duration: 500,
+        });
+
+        // Update detail panel
+        let detailHtml = `
+            <div class="detail-item">
+                <span class="detail-label">Subnet:</span> ${subnetData.label}
+            </div>
+        `;
+
+        if (data.nics.length > 0) {
+            detailHtml += `<div class="detail-item"><span class="detail-label">NICs (${data.nics.length}):</span></div>`;
+            data.nics.forEach(function(nic) {
+                detailHtml += `<div class="detail-item">&nbsp;&nbsp;${nic.name} - ${nic.private_ip || 'no IP'}`;
+                if (nic.vm_name) detailHtml += ` &rarr; ${nic.vm_name}`;
+                detailHtml += '</div>';
+            });
+        } else {
+            detailHtml += '<div class="detail-item">No NICs found</div>';
+        }
+
+        if (data.vms.length > 0) {
+            detailHtml += `<div class="detail-item"><span class="detail-label">VMs (${data.vms.length}):</span></div>`;
+            data.vms.forEach(function(vm) {
+                detailHtml += `<div class="detail-item">&nbsp;&nbsp;${vm.name}`;
+                if (vm.vm_size) detailHtml += ` (${vm.vm_size})`;
+                if (vm.os_type) detailHtml += ` - ${vm.os_type}`;
+                detailHtml += '</div>';
+            });
+        }
+
+        detailPanel.innerHTML = detailHtml;
+        showStatus('detailStatus',
+            `${data.nics.length} NICs, ${data.vms.length} VMs`, 'success');
+
+    } catch (e) {
+        showStatus('detailStatus', `Error: ${e.message}`, 'error');
+        drillDownActive = false;
+    }
+}
+
+/**
+ * Return to the full topology overview
+ */
+function backToOverview() {
+    // Remove drill-down nodes
+    cy.nodes('[type="vm_detail"]').remove();
+    cy.nodes('[type="vm"]').remove();
+    cy.nodes('[type="nic"]').remove();
+
+    // Restore opacity on all remaining nodes and edges
+    cy.nodes().style('opacity', 1);
+    cy.edges().style('opacity', 1);
+
+    // Reset any highlighted subnet borders
+    cy.nodes('[type="subnet"]').style({
+        'border-color': '#0078d4',
+        'border-width': 1,
+    });
+
+    // Hide detail panel
+    document.getElementById('detailSection').style.display = 'none';
+
+    // Zoom back to full view
+    cy.animate({
+        fit: { eles: cy.elements(), padding: 50 },
+        duration: 500,
+    });
+
+    drillDownActive = false;
 }
 
 /**

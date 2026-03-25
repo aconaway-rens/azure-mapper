@@ -144,6 +144,132 @@ resource "azurerm_virtual_network_peering" "vnet02_to_vnet91" {
   use_remote_gateways          = false
 }
 
+# --- VM in SAMPLE-VNET02-SUB01 ---
+
+resource "azurerm_network_interface" "vm_vnet02_nic" {
+  name                = "sample-vm-vnet02-nic"
+  location            = azurerm_resource_group.sample_rg.location
+  resource_group_name = azurerm_resource_group.sample_rg.name
+  tags                = local.tags
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.sample_vnet02_sub01.id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "vm_vnet02" {
+  name                            = "sample-vm-vnet02"
+  resource_group_name             = azurerm_resource_group.sample_rg.name
+  location                        = azurerm_resource_group.sample_rg.location
+  size                            = "Standard_B1ls"
+  admin_username                  = "azroot"
+  admin_password                  = "S@mple-P4ssw0rd!"
+  disable_password_authentication = false
+  tags                            = local.tags
+
+  network_interface_ids = [
+    azurerm_network_interface.vm_vnet02_nic.id,
+  ]
+
+  os_disk {
+    caching              = "None"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "ubuntu-24_04-lts"
+    sku       = "server-gen1"
+    version   = "latest"
+  }
+}
+
+# --- Second VM in SAMPLE-VNET02-SUB01 ---
+
+resource "azurerm_network_interface" "vm_vnet02b_nic" {
+  name                = "sample-vm-vnet02b-nic"
+  location            = azurerm_resource_group.sample_rg.location
+  resource_group_name = azurerm_resource_group.sample_rg.name
+  tags                = local.tags
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.sample_vnet02_sub01.id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "vm_vnet02b" {
+  name                            = "sample-vm-vnet02b"
+  resource_group_name             = azurerm_resource_group.sample_rg.name
+  location                        = azurerm_resource_group.sample_rg.location
+  size                            = "Standard_B1ls"
+  admin_username                  = "azroot"
+  admin_password                  = "S@mple-P4ssw0rd!"
+  disable_password_authentication = false
+  tags                            = local.tags
+
+  network_interface_ids = [
+    azurerm_network_interface.vm_vnet02b_nic.id,
+  ]
+
+  os_disk {
+    caching              = "None"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "ubuntu-24_04-lts"
+    sku       = "server-gen1"
+    version   = "latest"
+  }
+}
+
+# --- VM in SAMPLE-VNET91-SUB01 ---
+
+resource "azurerm_network_interface" "vm_vnet91_nic" {
+  name                = "sample-vm-vnet91-nic"
+  location            = azurerm_resource_group.sample2_rg.location
+  resource_group_name = azurerm_resource_group.sample2_rg.name
+  tags                = local.tags
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.sample_vnet91_sub01.id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+resource "azurerm_linux_virtual_machine" "vm_vnet91" {
+  name                            = "sample-vm-vnet91"
+  resource_group_name             = azurerm_resource_group.sample2_rg.name
+  location                        = azurerm_resource_group.sample2_rg.location
+  size                            = "Standard_B1ls"
+  admin_username                  = "azroot"
+  admin_password                  = "S@mple-P4ssw0rd!"
+  disable_password_authentication = false
+  tags                            = local.tags
+
+  network_interface_ids = [
+    azurerm_network_interface.vm_vnet91_nic.id,
+  ]
+
+  os_disk {
+    caching              = "None"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "ubuntu-24_04-lts"
+    sku       = "server-gen1"
+    version   = "latest"
+  }
+}
+
 resource "azurerm_virtual_network_peering" "vnet01_to_vnet91" {
   name                      = "SAMPLE-VNET01-to-SAMPLE-VNET91"
   resource_group_name       = azurerm_resource_group.sample_rg.name

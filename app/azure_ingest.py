@@ -4,6 +4,7 @@ from azure.core.credentials import AccessToken
 from azure.mgmt.subscription import SubscriptionClient
 from azure.mgmt.resource import ResourceManagementClient
 from azure.mgmt.network import NetworkManagementClient
+from azure.mgmt.compute import ComputeManagementClient
 from typing import Dict, List, Any
 import logging
 
@@ -120,6 +121,88 @@ class AzureResourceIngestor:
         except Exception as e:
             logger.error(f"Failed to fetch VNet peerings: {e}")
             return []
+
+    def get_subnet_resources(
+        self, subscription_id: str, subnet_azure_id: str
+    ) -> Dict[str, Any]:
+        """Fetch NICs and VMs attached to a specific subnet."""
+        try:
+            network_client = NetworkManagementClient(
+                self.credential, subscription_id
+            )
+            compute_client = ComputeManagementClient(
+                self.credential, subscription_id
+            )
+
+            nics = []
+            vm_ids_seen = set()
+            vms = []
+
+            # List all NICs and filter by subnet
+            for nic in network_client.network_interfaces.list_all():
+                if not nic.ip_configurations:
+                    continue
+                for ip_config in nic.ip_configurations:
+                    if (ip_config.subnet and
+                            ip_config.subnet.id.lower()
+                            == subnet_azure_id.lower()):
+                        nic_data = {
+                            "id": nic.id,
+                            "name": nic.name,
+                            "private_ip": ip_config.private_ip_address,
+                            "vm_id": None,
+                            "vm_name": None,
+                        }
+
+                        # Resolve VM if attached
+                        if nic.virtual_machine and nic.virtual_machine.id:
+                            vm_id = nic.virtual_machine.id
+                            nic_data["vm_id"] = vm_id
+                            vm_name = vm_id.split("/")[-1]
+                            nic_data["vm_name"] = vm_name
+
+                            if vm_id.lower() not in vm_ids_seen:
+                                vm_ids_seen.add(vm_id.lower())
+                                rg = vm_id.split("/")[4]
+                                try:
+                                    vm = compute_client.virtual_machines.get(
+                                        rg, vm_name
+                                    )
+                                    vms.append({
+                                        "id": vm.id,
+                                        "name": vm.name,
+                                        "vm_size": vm.hardware_profile.vm_size
+                                        if vm.hardware_profile else "",
+                                        "os_type": (
+                                            vm.storage_profile.os_disk.os_type
+                                            if vm.storage_profile
+                                            and vm.storage_profile.os_disk
+                                            else ""
+                                        ),
+                                    })
+                                except Exception as e:
+                                    logger.warning(
+                                        f"Could not fetch VM {vm_name}: {e}"
+                                    )
+                                    vms.append({
+                                        "id": vm_id,
+                                        "name": vm_name,
+                                        "vm_size": "",
+                                        "os_type": "",
+                                    })
+
+                        nics.append(nic_data)
+                        break  # matched this NIC, move on
+
+            logger.info(
+                f"Subnet {subnet_azure_id}: "
+                f"{len(nics)} NICs, {len(vms)} VMs"
+            )
+            return {"nics": nics, "vms": vms}
+
+        except Exception as e:
+            logger.error(f"Failed to fetch subnet resources: {e}")
+            return {"nics": [], "vms": []}
 
     def scan_subscription(self, subscription_id: str) -> Dict[str, Any]:
         """Perform a full scan of a subscription: VNets, subnets, and peerings."""

@@ -103,5 +103,5 @@ variable "vnet91_sub01_address" {
 variable "created_by_name" {
   description = "Name of the person/entity creating the resources"
   type        = string
-  default     = "Aaron Conaway"
+  default     = "Sample User"
 }

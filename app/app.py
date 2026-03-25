@@ -138,6 +138,29 @@ def get_graph_json():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/subnet/resources", methods=["POST"])
+def get_subnet_resources():
+    """Fetch NICs and VMs for a specific subnet."""
+    ingestor = get_ingestor()
+    if ingestor is None:
+        return jsonify({"error": "Authorization header with Bearer token required"}), 401
+
+    data = request.get_json() or {}
+    subscription_id = data.get("subscription_id")
+    subnet_azure_id = data.get("subnet_azure_id")
+
+    if not subscription_id or not subnet_azure_id:
+        return jsonify({"error": "subscription_id and subnet_azure_id required"}), 400
+
+    try:
+        logger.info(f"Fetching resources for subnet: {subnet_azure_id}")
+        resources = ingestor.get_subnet_resources(subscription_id, subnet_azure_id)
+        return jsonify(resources)
+    except Exception as e:
+        logger.error(f"Error fetching subnet resources: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/graph/clear", methods=["POST"])
 def clear_graph():
     """Clear the current graph."""

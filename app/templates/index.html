@@ -170,6 +170,38 @@
         .vnet { background: #e6f2ff; border: 2px dashed #0078d4; }
         .subnet { background: #50e6ff; }
         .peering { background: #107c10; }
+        .nic-color { background: #ff8c00; }
+        .vm-color { background: #8661c5; }
+
+        .detail-panel {
+            background: #f9f9f9;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+
+        .detail-panel .detail-item {
+            padding: 6px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .detail-panel .detail-item:last-child {
+            border-bottom: none;
+        }
+
+        .detail-label {
+            font-weight: 600;
+            color: #0078d4;
+        }
+
+        button.back-btn {
+            background: #666;
+        }
+
+        button.back-btn:hover {
+            background: #555;
+        }
     </style>
 </head>
 <body>
@@ -195,6 +227,13 @@
                 <h3>Scan Resources</h3>
                 <button onclick="scanSubscription()" id="scanBtn">Scan Resources</button>
                 <div id="scanStatus" class="status" style="display:none;"></div>
+            </div>
+
+            <div class="section" id="detailSection" style="display:none;">
+                <h3>Subnet Detail</h3>
+                <button class="back-btn" onclick="backToOverview()">Back to Overview</button>
+                <div id="detailPanel" class="detail-panel"></div>
+                <div id="detailStatus" class="status" style="display:none;"></div>
             </div>
 
             <div class="section">
@@ -224,6 +263,14 @@
                     <div class="legend-item">
                         <div class="legend-color peering"></div>
                         <span>Peering</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color nic-color"></div>
+                        <span>Network Interface</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color vm-color"></div>
+                        <span>Virtual Machine</span>
                     </div>
                 </div>
             </div>

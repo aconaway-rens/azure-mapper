@@ -112,3 +112,13 @@ output "peering_vnet02_to_vnet91_id" {
   description = "Peering from SAMPLE-VNET02 to SAMPLE-VNET91 ID"
   value       = azurerm_virtual_network_peering.vnet02_to_vnet91.id
 }
+
+output "vm_vnet02_id" {
+  description = "VM in VNET02-SUB01"
+  value       = azurerm_linux_virtual_machine.vm_vnet02.id
+}
+
+output "vm_vnet91_id" {
+  description = "VM in VNET91-SUB01"
+  value       = azurerm_linux_virtual_machine.vm_vnet91.id
+}
