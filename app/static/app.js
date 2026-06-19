@@ -6,6 +6,7 @@ let cy = null;
 let currentGraph = null;
 let msalInstance = null;
 let drillDownActive = false;
+let lastAnalysis = null;  // most recent /api/analyze result, for export
 
 // MSAL configuration
 const msalConfig = {
@@ -202,18 +203,37 @@ function initializeCytoscape() {
                     'curve-style': 'bezier',
                 }
             },
-            // Peering edges
+            // Peering edges (base)
             {
                 selector: 'edge[type="peered_to"]',
                 style: {
                     'line-color': '#107c10',
                     'target-arrow-color': '#107c10',
+                    'target-arrow-shape': 'triangle',
                     'line-style': 'dashed',
                     'width': 2,
                     'label': 'peering',
                     'font-size': 8,
                     'color': '#107c10',
                     'text-rotation': 'autorotate',
+                }
+            },
+            // Healthy bidirectional peering — arrowheads on both ends, one line
+            {
+                selector: 'edge[type="peered_to"][?bidirectional]',
+                style: {
+                    'source-arrow-shape': 'triangle',
+                    'source-arrow-color': '#107c10',
+                }
+            },
+            // One-way peering — only one direction exists. Flag it in red.
+            {
+                selector: 'edge[type="peered_to"][!bidirectional]',
+                style: {
+                    'line-color': '#d13438',
+                    'target-arrow-color': '#d13438',
+                    'color': '#d13438',
+                    'label': '1-way peering',
                 }
             },
             // NIC nodes
@@ -719,6 +739,151 @@ function backToOverview() {
 }
 
 /**
+ * Escape a string for safe insertion into HTML (model output is untrusted).
+ */
+function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+/**
+ * Ask Claude to review the current topology and render the findings.
+ * Operates on the already-scanned graph held server-side, so no Azure token
+ * is sent here.
+ */
+async function analyzeTopology() {
+    const btn = document.getElementById('analyzeBtn');
+    const exportBtn = document.getElementById('exportBtn');
+    const panel = document.getElementById('findingsPanel');
+    panel.style.display = 'none';
+    panel.innerHTML = '';
+    exportBtn.style.display = 'none';
+    lastAnalysis = null;
+    btn.disabled = true;
+    showStatus('analyzeStatus', 'Analyzing topology with Claude…', 'loading');
+
+    try {
+        const res = await fetch('/api/analyze');
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data.error || 'Analysis failed');
+        }
+
+        lastAnalysis = data;
+        renderFindings(data);
+        exportBtn.style.display = 'block';
+        const n = (data.findings || []).length;
+        showStatus('analyzeStatus',
+            `Review complete: ${n} finding${n === 1 ? '' : 's'}`, 'success');
+    } catch (e) {
+        showStatus('analyzeStatus', `Error: ${e.message}`, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+/**
+ * Export the most recent review as a Markdown report and trigger a download.
+ */
+function exportFindings() {
+    if (!lastAnalysis) return;
+
+    const order = { high: 0, medium: 1, low: 2, info: 3 };
+    const findings = (lastAnalysis.findings || []).slice().sort(
+        (a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9)
+    );
+
+    const now = new Date();
+    const lines = [];
+    lines.push('# Azure Network Review');
+    lines.push('');
+    lines.push(`*Generated ${now.toLocaleString()} — ${findings.length} finding${findings.length === 1 ? '' : 's'}*`);
+    lines.push('');
+    if (lastAnalysis.summary) {
+        lines.push('## Summary');
+        lines.push('');
+        lines.push(lastAnalysis.summary);
+        lines.push('');
+    }
+
+    if (findings.length === 0) {
+        lines.push('No issues found.');
+    } else {
+        lines.push('## Findings');
+        lines.push('');
+        findings.forEach((f, i) => {
+            const sev = String(f.severity || 'info').toUpperCase();
+            lines.push(`### ${i + 1}. [${sev}] ${f.title || '(untitled)'}`);
+            lines.push('');
+            lines.push(`- **Category:** ${f.category || 'other'}`);
+            const resources = (f.affected_resources || []).join(', ');
+            if (resources) lines.push(`- **Affected:** ${resources}`);
+            lines.push('');
+            lines.push(f.finding || '');
+            lines.push('');
+            lines.push(`**Fix:** ${f.recommendation || ''}`);
+            lines.push('');
+        });
+    }
+
+    const stamp = now.toISOString().slice(0, 19).replace(/[:T]/g, '-');
+    downloadFile(`azure-network-review-${stamp}.md`, lines.join('\n'), 'text/markdown');
+}
+
+/**
+ * Trigger a client-side file download for the given text content.
+ */
+function downloadFile(filename, content, mime) {
+    const blob = new Blob([content], { type: `${mime};charset=utf-8` });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+/**
+ * Render the structured review into the sidebar.
+ */
+function renderFindings(data) {
+    const panel = document.getElementById('findingsPanel');
+    const order = { high: 0, medium: 1, low: 2, info: 3 };
+
+    let html = '';
+    if (data.summary) {
+        html += `<div class="analysis-summary">${escapeHtml(data.summary)}</div>`;
+    }
+
+    const findings = (data.findings || []).slice().sort(
+        (a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9)
+    );
+
+    if (findings.length === 0) {
+        html += `<div class="status success" style="display:block;">No issues found.</div>`;
+    }
+
+    findings.forEach(f => {
+        const sev = String(f.severity || 'info').toLowerCase();
+        const resources = (f.affected_resources || []).join(', ');
+        html += `
+            <div class="finding ${escapeHtml(sev)}">
+                <div class="sev">${escapeHtml(sev)} &middot; ${escapeHtml(f.category || '')}</div>
+                <div class="ftitle">${escapeHtml(f.title || '')}</div>
+                <div class="fbody">${escapeHtml(f.finding || '')}</div>
+                <div class="frec"><strong>Fix:</strong> ${escapeHtml(f.recommendation || '')}</div>
+                ${resources ? `<div class="fres">Affected: ${escapeHtml(resources)}</div>` : ''}
+            </div>`;
+    });
+
+    panel.innerHTML = html;
+    panel.style.display = 'block';
+}
+
+/**
  * Clear the graph
  */
 async function clearGraph() {
@@ -728,6 +893,11 @@ async function clearGraph() {
             cy.elements().remove();
         }
         document.getElementById('graphInfo').style.display = 'none';
+        document.getElementById('findingsPanel').style.display = 'none';
+        document.getElementById('findingsPanel').innerHTML = '';
+        document.getElementById('analyzeStatus').style.display = 'none';
+        document.getElementById('exportBtn').style.display = 'none';
+        lastAnalysis = null;
         showStatus('scanStatus', 'Graph cleared', 'success');
     } catch (e) {
         showStatus('scanStatus', `Error: ${e.message}`, 'error');

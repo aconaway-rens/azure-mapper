@@ -15,10 +15,20 @@ A web application that visualizes Azure network topology — VNets, subnets, pee
   - Peering connections shown as dashed green edges
 - **Works across tenants** — sign in with any Microsoft account that has Reader access
 
+- **AI Network Review** — sends the discovered topology to Claude (`claude-opus-4-8`)
+  and returns a structured review (addressing/peering/design/naming findings with
+  severity and recommendations). Click **Review with Claude** in the sidebar after a scan.
+
+  > ⚠️ The review sends the topology graph (VNet names, CIDRs, peerings) to the
+  > Anthropic API. Use it against **lab subscriptions you own**. A customer's
+  > topology is customer data — don't send it to a third-party API without the
+  > appropriate agreement (e.g. an Azure-hosted model or sanitization).
+
 ## Prerequisites
 
 - Docker and Docker Compose
 - An Azure AD app registration (multi-tenant, SPA redirect to `http://localhost:8080`)
+- An Anthropic API key (for AI Network Review) — set `ANTHROPIC_API_KEY` in `app/.env`
 
 ## Quick Start
 

@@ -8,8 +8,11 @@ build/
 .venv/
 venv/
 
-# Environment
+# Environment — never commit real secrets (Azure tokens, ANTHROPIC_API_KEY).
+# Matches .env in any directory (incl. app/.env); keeps .env.example tracked.
 .env
+.env.*
+!.env.example
 
 # Logs
 *.log

@@ -1,10 +1,15 @@
 """Flask app for Azure resource visualization."""
 
 import logging
+from dotenv import load_dotenv
 from flask import Flask, render_template, jsonify, request
 from flask_cors import CORS
 from azure_ingest import AzureResourceIngestor
 from graph_builder import TopologyGraph
+from analyzer import analyze_topology
+
+# Load app/.env for local runs (Docker injects these via env_file).
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -135,6 +140,29 @@ def get_graph_json():
         })
     except Exception as e:
         logger.error(f"Error fetching graph JSON: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/analyze", methods=["GET"])
+def analyze():
+    """Run a Claude-powered review of the current topology graph.
+
+    Operates on the already-scanned in-memory graph, so no Azure token is
+    needed here — only ANTHROPIC_API_KEY in the environment.
+    """
+    if current_graph is None:
+        return jsonify({"error": "No scan data available. Run /api/scan first."}), 400
+
+    try:
+        graph_data = current_graph.to_dict()
+        result = analyze_topology(graph_data)
+        return jsonify(result)
+    except ValueError as e:
+        # Configuration problem (e.g. missing API key) — actionable for the user.
+        logger.error(f"Analysis configuration error: {e}")
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error analyzing topology: {e}")
         return jsonify({"error": str(e)}), 500
 
 

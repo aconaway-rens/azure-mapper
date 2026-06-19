@@ -149,7 +149,16 @@ class TopologyGraph:
                     })
 
     def to_cytoscape_format(self) -> Dict[str, List[Dict[str, Any]]]:
-        """Export graph in Cytoscape.js format."""
+        """Export graph in Cytoscape.js format.
+
+        Peering edges are collapsed for display: Azure represents a
+        bidirectional peering as two separate resources (A->B and B->A), which
+        would otherwise draw two parallel arrows. We render one edge per VNet
+        pair, flagged ``bidirectional`` when both directions exist and left as a
+        single directional edge when only one does (a one-way peering worth
+        highlighting). This is a display-only change — ``to_dict()`` still
+        carries every peering so the analyzer can detect one-way peerings.
+        """
         elements = []
 
         # Add nodes
@@ -164,15 +173,36 @@ class TopologyGraph:
                 node_data["parent"] = node.parent
             elements.append({"data": node_data})
 
-        # Add edges
-        for edge_id, edge in self.edges.items():
+        # Group peering edges by unordered VNet pair; pass other edges through.
+        peering_groups: Dict[frozenset, List[GraphEdge]] = {}
+        for edge in self.edges.values():
+            if edge.type == "peered_to":
+                key = frozenset((edge.source, edge.target))
+                peering_groups.setdefault(key, []).append(edge)
+            else:
+                elements.append({
+                    "data": {
+                        "id": edge.id,
+                        "source": edge.source,
+                        "target": edge.target,
+                        "type": edge.type,
+                        **edge.data,
+                    }
+                })
+
+        # Emit one edge per peering pair.
+        for edges in peering_groups.values():
+            rep = edges[0]
+            bidirectional = len(edges) >= 2
+            pair_id = "peer_" + "__".join(sorted((rep.source, rep.target)))
             elements.append({
                 "data": {
-                    "id": edge_id,
-                    "source": edge.source,
-                    "target": edge.target,
-                    "type": edge.type,
-                    **edge.data,
+                    "id": pair_id,
+                    "source": rep.source,
+                    "target": rep.target,
+                    "type": "peered_to",
+                    "bidirectional": bidirectional,
+                    **rep.data,
                 }
             })
 

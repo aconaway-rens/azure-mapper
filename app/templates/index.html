@@ -202,6 +202,71 @@
         button.back-btn:hover {
             background: #555;
         }
+
+        /* AI Network Review findings */
+        .analysis-summary {
+            font-size: 12px;
+            color: #333;
+            background: #eef6ff;
+            border: 1px solid #cfe4fb;
+            padding: 8px;
+            border-radius: 4px;
+            margin-bottom: 8px;
+            line-height: 1.5;
+        }
+
+        .finding {
+            background: #fff;
+            border: 1px solid #eee;
+            border-left: 4px solid #999;
+            padding: 8px;
+            margin-bottom: 8px;
+            border-radius: 4px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+
+        .finding.high { border-left-color: #d13438; }
+        .finding.medium { border-left-color: #f7630c; }
+        .finding.low { border-left-color: #ffb900; }
+        .finding.info { border-left-color: #0078d4; }
+
+        .finding .sev {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #777;
+        }
+        .finding.high .sev { color: #d13438; }
+        .finding.medium .sev { color: #c2500a; }
+        .finding.low .sev { color: #9a7000; }
+        .finding.info .sev { color: #0078d4; }
+
+        .finding .ftitle {
+            font-weight: 600;
+            font-size: 12px;
+            margin: 2px 0 4px;
+            color: #222;
+        }
+
+        .finding .fbody {
+            font-size: 11px;
+            color: #444;
+            line-height: 1.5;
+        }
+
+        .finding .frec {
+            font-size: 11px;
+            color: #155724;
+            margin-top: 4px;
+        }
+
+        .finding .fres {
+            font-size: 10px;
+            color: #777;
+            margin-top: 4px;
+            word-break: break-word;
+        }
     </style>
 </head>
 <body>
@@ -234,6 +299,14 @@
                 <button class="back-btn" onclick="backToOverview()">Back to Overview</button>
                 <div id="detailPanel" class="detail-panel"></div>
                 <div id="detailStatus" class="status" style="display:none;"></div>
+            </div>
+
+            <div class="section">
+                <h3>AI Network Review</h3>
+                <button onclick="analyzeTopology()" id="analyzeBtn">Review with Claude</button>
+                <div id="analyzeStatus" class="status" style="display:none;"></div>
+                <div id="findingsPanel" style="display:none;"></div>
+                <button onclick="exportFindings()" id="exportBtn" style="display:none;">Export findings (.md)</button>
             </div>
 
             <div class="section">

@@ -25,4 +25,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 EXPOSE 8080
 
 # Run gunicorn (--no-sendfile avoids socket issues in containers)
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--access-logfile", "-", "--error-logfile", "-", "--config", "/dev/null", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "300", "--no-sendfile", "--access-logfile", "-", "--error-logfile", "-", "--config", "/dev/null", "app:app"]
