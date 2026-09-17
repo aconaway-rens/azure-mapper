@@ -249,6 +249,27 @@ function topologyStyles() {
                     'text-max-width': '130px',
                 }
             },
+            // NIC with no VM behind it — flagged, since an orphan NIC is
+            // usually a leftover worth noticing
+            {
+                selector: 'node[type="nic"][?orphan]',
+                style: {
+                    'border-color': '#d13438',
+                    'border-width': 2,
+                    'border-style': 'dashed',
+                }
+            },
+            // Links a spanning VM to its NIC in each subnet
+            {
+                selector: 'edge[type="attached_to"]',
+                style: {
+                    'line-color': '#8661c5',
+                    'target-arrow-shape': 'none',
+                    'width': 2,
+                    'curve-style': 'bezier',
+                    'opacity': 0.85,
+                }
+            },
             // VM container node (name at top)
             {
                 selector: 'node[type="vm"]',
@@ -457,7 +478,7 @@ function layoutTopology(rgNodes) {
     const RG_GAP_X = 90, RG_GAP_Y = 90, RG_PAD = 45;
     const VNET_GAP = 45, VNET_PAD = 32;
     const SUBNET_GAP = 30, SUBNET_PAD = 24, SUBNET_TITLE_H = 38;
-    const CARD_W = 185, CARD_H = 80, CARD_GAP = 16;
+    const CARD_W = 185, CARD_H = 80, CARD_GAP = 16, SPANNING_VM_GAP = 60;
 
     const cols = Math.max(Math.ceil(Math.sqrt(rgNodes.length)), 1);
     let cursorY = 0, idx = 0;
@@ -482,9 +503,26 @@ function layoutTopology(rgNodes) {
 
     function layoutVnet(vnet, x, y) {
         let subnetX = x + VNET_PAD;
+        let subnetBottom = y + VNET_PAD;
+
         vnet.children('[type="subnet"]').forEach(function(subnet) {
-            subnetX += layoutSubnet(subnet, subnetX, y + VNET_PAD).w + SUBNET_GAP;
+            const size = layoutSubnet(subnet, subnetX, y + VNET_PAD);
+            subnetX += size.w + SUBNET_GAP;
+            subnetBottom = Math.max(subnetBottom, y + VNET_PAD + size.h);
         });
+
+        // A VM spanning subnets is a child of the VNet, not of any subnet. It
+        // goes in a row underneath them, so its NIC links run down into the
+        // subnets it reaches rather than across the diagram.
+        const spanning = vnet.children('[type="vm"]');
+        if (spanning.length > 0) {
+            let vmX = x + VNET_PAD;
+            const rowY = subnetBottom + SPANNING_VM_GAP;
+            spanning.forEach(function(vm) {
+                placeCard(vm, vmX + CARD_W / 2, rowY + CARD_H / 2);
+                vmX += CARD_W + CARD_GAP;
+            });
+        }
         return alignAndMeasure(vnet, x, y);
     }
 
@@ -729,30 +767,45 @@ function syncWorkloadCards() {
 /**
  * Group the scan's VM and NIC cards by the subnet they belong to.
  *
+ * Only cards a subnet owns are indexed. A VM that spans subnets is parented to
+ * the VNet and stays in the graph permanently — it belongs to no one subnet,
+ * so no one subnet gets to collapse it away.
+ *
  * Order matters on the way back in: a VM has to exist before the detail card
- * that names it as parent, so parents are emitted ahead of their children.
+ * naming it as parent, and both endpoints of an attachment edge have to exist
+ * before the edge does. Nodes are therefore emitted ahead of edges.
  */
 function indexWorkloads(elements) {
+    const subnetIds = new Set();
     const vmToSubnet = {};
+    const nicToSubnet = {};
     workloadsBySubnet = {};
     totalVmCount = 0;
 
     elements.forEach(function(el) {
+        if (el.data.type === 'subnet') subnetIds.add(el.data.id);
+        if (el.data.type === 'vm') totalVmCount += 1;
+    });
+
+    function own(subnetId, el) {
+        (workloadsBySubnet[subnetId] = workloadsBySubnet[subnetId] || []).push(el);
+    }
+
+    elements.forEach(function(el) {
         const d = el.data;
-        if (d.type === 'vm' || d.type === 'nic') {
-            if (d.type === 'vm') {
-                vmToSubnet[d.id] = d.parent;
-                totalVmCount += 1;
-            }
-            (workloadsBySubnet[d.parent] = workloadsBySubnet[d.parent] || []).push(el);
+        if ((d.type === 'vm' || d.type === 'nic') && subnetIds.has(d.parent)) {
+            if (d.type === 'vm') vmToSubnet[d.id] = d.parent;
+            else nicToSubnet[d.id] = d.parent;
+            own(d.parent, el);
         }
     });
     elements.forEach(function(el) {
         const d = el.data;
-        if (d.type === 'vm_detail') {
-            const subnetId = vmToSubnet[d.parent];
-            if (subnetId) workloadsBySubnet[subnetId].push(el);
-        }
+        if (d.type === 'vm_detail' && vmToSubnet[d.parent]) own(vmToSubnet[d.parent], el);
+    });
+    elements.forEach(function(el) {
+        const d = el.data;
+        if (d.source && nicToSubnet[d.target]) own(nicToSubnet[d.target], el);
     });
 }
 
@@ -867,13 +920,22 @@ function drillDownToSubnet(subnetNode) {
     layoutVisible();
 
     // Dim everything that isn't this subnet, its contents, or its containers.
+    // A VM spanning subnets lives outside this one but is half the story of
+    // what's in it, so anything wired to a NIC in here stays lit too.
+    const linked = subnetNode.descendants().neighborhood('node[type="vm"]');
     const keep = subnetNode
         .union(subnetNode.ancestors())
-        .union(subnetNode.descendants());
+        .union(subnetNode.descendants())
+        .union(linked)
+        .union(linked.descendants());
+
     cy.nodes().forEach(function(node) {
         node.style('opacity', keep.contains(node) ? 1 : 0.15);
     });
-    cy.edges().style('opacity', 0.1);
+    cy.edges().forEach(function(edge) {
+        const wired = keep.contains(edge.source()) && keep.contains(edge.target());
+        edge.style('opacity', wired ? 1 : 0.1);
+    });
 
     subnetNode.style({ 'border-color': '#e8374a', 'border-width': 3 });
 
@@ -914,11 +976,23 @@ function renderSubnetDetail(subnetNode) {
         });
     }
 
-    if (nics.length > 0) {
-        html += `<div class="detail-item"><span class="detail-label">Unattached NICs (${nics.length}):</span></div>`;
-        nics.forEach(function(nic) {
+    const orphans = nics.filter(function(nic) { return nic.data('orphan'); });
+    const attached = nics.difference(orphans);
+
+    if (attached.length > 0) {
+        html += `<div class="detail-item"><span class="detail-label">NICs of VMs spanning subnets (${attached.length}):</span></div>`;
+        attached.forEach(function(nic) {
             const d = nic.data();
-            html += `<div class="detail-item">&nbsp;&nbsp;${d.label.replace('\n', ' - ')}</div>`;
+            let line = `&nbsp;&nbsp;${d.label.replace('\n', ' - ')}`;
+            if (d.vm_name) line += ` &rarr; ${d.vm_name}`;
+            html += `<div class="detail-item">${line}</div>`;
+        });
+    }
+
+    if (orphans.length > 0) {
+        html += `<div class="detail-item"><span class="detail-label">Unattached NICs (${orphans.length}):</span></div>`;
+        orphans.forEach(function(nic) {
+            html += `<div class="detail-item">&nbsp;&nbsp;${nic.data('label').replace('\n', ' - ')}</div>`;
         });
     }
 

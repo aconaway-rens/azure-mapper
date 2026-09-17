@@ -90,6 +90,25 @@ class TopologyGraph:
             nics_by_subnet.setdefault(nic["subnet_id"], []).append(nic)
         vms_by_id = scan_data.get("vms", {})
 
+        # A VM whose NICs land in more than one subnet — a firewall or an NVA,
+        # typically — belongs in no single subnet box, and drawing a copy of it
+        # inside each one makes four firewalls out of one. Such a VM instead
+        # gets a single node at the VNet level wired to a NIC in each subnet.
+        # Azure requires every NIC on a VM to sit in the same VNet, so that
+        # level always exists and is always the right home for it.
+        subnets_per_vm: Dict[str, set] = {}
+        for nic in scan_data.get("nics", []):
+            if nic.get("vm_id"):
+                subnets_per_vm.setdefault(
+                    nic["vm_id"].lower(), set()
+                ).add(nic["subnet_id"])
+        spanning_vms = {
+            vm_id for vm_id, subnets in subnets_per_vm.items()
+            if len(subnets) > 1
+        }
+        # vm_id -> {vnet node, [nic node ids]}, filled in as subnets are walked
+        spanning_attachments: Dict[str, Dict[str, Any]] = {}
+
         # Track resource groups so we create each one only once
         resource_groups = set()
 
@@ -155,8 +174,11 @@ class TopologyGraph:
                 )
 
                 self._add_subnet_workloads(
-                    subnet_node_id, subnet_nics, vms_by_id
+                    subnet_node_id, vnet_id, subnet_nics, vms_by_id,
+                    spanning_vms, spanning_attachments,
                 )
+
+        self._add_spanning_vms(spanning_attachments, vms_by_id)
 
         # Create peering edges
         for peering in peerings:
@@ -181,20 +203,44 @@ class TopologyGraph:
     def _add_subnet_workloads(
         self,
         subnet_node_id: str,
+        vnet_node_id: str,
         subnet_nics: List[Dict[str, Any]],
         vms_by_id: Dict[str, Dict[str, Any]],
+        spanning_vms: set,
+        spanning_attachments: Dict[str, Dict[str, Any]],
     ) -> None:
         """Add the VM and NIC nodes living inside one subnet.
 
-        A VM becomes a compound node holding one detail child (size, OS, and
-        its IPs on this subnet), matching what the subnet drill-down has always
-        drawn. A NIC with no VM attached is drawn on its own, since an orphaned
-        NIC is usually worth noticing.
+        A VM confined to this subnet becomes a compound node holding one detail
+        child (size, OS, and its IPs here). A VM that spans subnets gets only
+        its NIC drawn here; the VM itself is recorded for later, so one node can
+        stand for it across every subnet it reaches. A NIC with no VM attached
+        is drawn on its own, since an orphaned NIC is usually worth noticing.
         """
         vm_nics: Dict[str, List[Dict[str, Any]]] = {}
+
         for nic in subnet_nics:
-            if nic.get("vm_id"):
-                vm_nics.setdefault(nic["vm_id"].lower(), []).append(nic)
+            vm_id = (nic.get("vm_id") or "").lower()
+
+            if vm_id and vm_id in spanning_vms:
+                nic_node_id = f"nic_{subnet_node_id}_{nic['name']}"
+                self.add_node(
+                    nic_node_id, "nic",
+                    f"{nic['name']}\n{nic.get('private_ip') or 'no IP'}",
+                    parent=subnet_node_id,
+                    data={
+                        "azure_id": nic["id"],
+                        "private_ip": nic.get("private_ip"),
+                        "vm_name": nic.get("vm_name"),
+                        "orphan": False,
+                    },
+                )
+                entry = spanning_attachments.setdefault(
+                    vm_id, {"vnet": vnet_node_id, "nics": []}
+                )
+                entry["nics"].append(nic_node_id)
+            elif vm_id:
+                vm_nics.setdefault(vm_id, []).append(nic)
             else:
                 self.add_node(
                     f"nic_{subnet_node_id}_{nic['name']}",
@@ -235,6 +281,48 @@ class TopologyGraph:
                 parent=vm_node_id,
                 data={},
             )
+
+    def _add_spanning_vms(
+        self,
+        spanning_attachments: Dict[str, Dict[str, Any]],
+        vms_by_id: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Add one node per multi-subnet VM, wired to each of its NICs.
+
+        These sit at the VNet level rather than inside a subnet, which is what
+        keeps a four-armed firewall a single object in the diagram instead of
+        four unrelated ones.
+        """
+        for vm_id, entry in spanning_attachments.items():
+            vm = vms_by_id.get(vm_id, {})
+            vm_name = vm.get("name") or vm_id.split("/")[-1]
+            vm_node_id = f"vm_shared_{vm_name}"
+            span = len(entry["nics"])
+
+            self.add_node(
+                vm_node_id, "vm", vm_name,
+                parent=entry["vnet"],
+                data={
+                    "azure_id": vm.get("id") or vm_id,
+                    "vm_size": vm.get("vm_size", ""),
+                    "os_type": vm.get("os_type", ""),
+                    "resource_group": vm.get("resource_group", ""),
+                    "spans_subnets": span,
+                },
+            )
+
+            detail = [p for p in (
+                vm.get("vm_size"), vm.get("os_type"), f"{span} subnets",
+            ) if p]
+            self.add_node(
+                f"{vm_node_id}_detail", "vm_detail",
+                "\n".join(detail),
+                parent=vm_node_id,
+                data={},
+            )
+
+            for nic_node_id in entry["nics"]:
+                self.add_edge(vm_node_id, nic_node_id, "attached_to", {})
 
     def to_cytoscape_format(self) -> Dict[str, List[Dict[str, Any]]]:
         """Export graph in Cytoscape.js format.

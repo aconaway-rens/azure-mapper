@@ -186,6 +186,8 @@
         .subnet-collapsed { background: #b9a3e0; border: 2px dashed #8661c5; }
         .peering { background: #107c10; }
         .nic-color { background: #ff8c00; }
+        .nic-orphan { background: #ff8c00; border: 2px dashed #d13438; }
+        .attached-link { background: #8661c5; border-radius: 0; height: 3px; }
         .vm-color { background: #8661c5; }
 
         .detail-panel {
@@ -369,6 +371,14 @@
                     <div class="legend-item">
                         <div class="legend-color nic-color"></div>
                         <span>Network Interface</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color nic-orphan"></div>
+                        <span>Unattached NIC</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color attached-link"></div>
+                        <span>VM &rarr; NIC (spans subnets)</span>
                     </div>
                     <div class="legend-item">
                         <div class="legend-color vm-color"></div>

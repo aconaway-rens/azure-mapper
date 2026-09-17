@@ -21,6 +21,10 @@ else; no topology data leaves the host it runs on.
 - **VMs and NICs in the diagram** — workloads are drawn inside their subnets,
   with size, OS, and private IPs on each card. Unattached NICs are drawn on
   their own, since an orphaned NIC is usually worth noticing.
+- **Multi-homed VMs stay one object** — a firewall or NVA with a NIC in four
+  subnets is drawn once, at the VNet level, linked to its NIC in each subnet,
+  rather than as four unrelated VMs. Azure requires every NIC on a VM to sit in
+  the same VNet, so that level is always the right home for it.
 - **Per-subnet render limit** — a subnet holding more NICs than the limit
   (default 10) collapses to a marked summary instead of flooding the diagram,
   so a subscription with fifty VMs behind one subnet still reads. Subnets
