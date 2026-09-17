@@ -1,5 +1,11 @@
 FROM python:3.12-slim
 
+# Set to true to bake in the Azure CLI, which lets the container reuse an
+# `az login` session mounted from the host (see docker-compose.yml). Leave
+# false for managed-identity or service-principal hosts — those need no CLI
+# and keep the image ~400MB smaller.
+ARG WITH_AZURE_CLI=false
+
 WORKDIR /app
 
 # Install system dependencies
@@ -13,6 +19,9 @@ COPY app/requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Optional Azure CLI, for hosts that authenticate with `az login`
+RUN if [ "$WITH_AZURE_CLI" = "true" ]; then pip install --no-cache-dir azure-cli; fi
 
 # Copy app code
 COPY app/ .

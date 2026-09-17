@@ -4,99 +4,40 @@
 
 let cy = null;
 let currentGraph = null;
-let msalInstance = null;
 let drillDownActive = false;
-let lastAnalysis = null;  // most recent /api/analyze result, for export
 
-// MSAL configuration
-const msalConfig = {
-    auth: {
-        clientId: '18ea91ca-8997-483d-a9d3-72da14f6a69b',
-        authority: 'https://login.microsoftonline.com/common',
-        redirectUri: window.location.origin,
-    },
-    cache: {
-        cacheLocation: 'sessionStorage',
-    },
-};
-
-const loginRequest = {
-    scopes: ['https://management.azure.com/user_impersonation'],
-};
+// Resource-group filter state. `allResourceGroups` is every RG in the current
+// scan; `selectedResourceGroups` is the subset drawn on the canvas. The Set is
+// the source of truth rather than the checkboxes, because the list is
+// re-rendered whenever the search box narrows it.
+let allResourceGroups = [];
+let selectedResourceGroups = new Set();
 
 /**
- * Get an access token for Azure Management API
+ * Ask the backend which Azure identity it resolved.
+ *
+ * Authentication happens server-side via DefaultAzureCredential, so there is
+ * nothing to sign into here — this just reports what the host is running as,
+ * and surfaces the credential error if it resolved nothing.
  */
-async function getAccessToken() {
-    const accounts = msalInstance.getAllAccounts();
-    if (accounts.length === 0) {
-        throw new Error('Not signed in');
-    }
-
+async function checkIdentity() {
+    showStatus('authStatus', 'Checking Azure credential…', 'loading');
     try {
-        const response = await msalInstance.acquireTokenSilent({
-            ...loginRequest,
-            account: accounts[0],
-        });
-        return response.accessToken;
+        const res = await fetch('/api/identity');
+        const data = await res.json();
+
+        if (!res.ok || !data.authenticated) {
+            throw new Error(data.error || 'No Azure credential available');
+        }
+
+        showStatus('authStatus', `Signed in as ${data.identity || 'host identity'}`, 'success');
+        const tenant = document.getElementById('tenantInfo');
+        if (data.tenant_id) {
+            tenant.textContent = `Tenant ${data.tenant_id}`;
+            tenant.style.display = 'block';
+        }
     } catch (e) {
-        // Silent token acquisition failed — try interactive
-        const response = await msalInstance.acquireTokenPopup(loginRequest);
-        return response.accessToken;
-    }
-}
-
-/**
- * Make an authenticated fetch request
- */
-async function authFetch(url, options = {}) {
-    const token = await getAccessToken();
-    const headers = {
-        ...options.headers,
-        'Authorization': `Bearer ${token}`,
-    };
-    return fetch(url, { ...options, headers });
-}
-
-/**
- * Sign in with Microsoft
- */
-async function signIn() {
-    try {
-        showStatus('authStatus', 'Signing in...', 'loading');
-        const response = await msalInstance.loginPopup(loginRequest);
-        updateAuthUI(response.account);
-        showStatus('authStatus', 'Signed in', 'success');
-    } catch (e) {
-        showStatus('authStatus', `Sign in failed: ${e.message}`, 'error');
-    }
-}
-
-/**
- * Sign out
- */
-async function signOut() {
-    await msalInstance.logoutPopup();
-    updateAuthUI(null);
-    showStatus('authStatus', 'Not signed in', 'info');
-}
-
-/**
- * Update UI to reflect auth state
- */
-function updateAuthUI(account) {
-    const authBtn = document.getElementById('authBtn');
-    const userName = document.getElementById('userName');
-
-    if (account) {
-        authBtn.textContent = 'Sign Out';
-        authBtn.onclick = signOut;
-        userName.textContent = account.username;
-        userName.style.display = 'block';
-    } else {
-        authBtn.textContent = 'Sign In with Microsoft';
-        authBtn.onclick = signIn;
-        userName.style.display = 'none';
+        showStatus('authStatus', `No Azure credential: ${e.message}`, 'error');
     }
 }
 
@@ -324,7 +265,7 @@ function showStatus(elementId, message, type = 'info') {
 async function loadSubscriptions() {
     showStatus('subStatus', 'Loading subscriptions...', 'loading');
     try {
-        const res = await authFetch('/api/subscriptions');
+        const res = await fetch('/api/subscriptions');
         const data = await res.json();
 
         if (!res.ok) {
@@ -362,7 +303,7 @@ async function scanSubscription() {
     showStatus('scanStatus', 'Scanning resources...', 'loading');
 
     try {
-        const res = await authFetch('/api/scan', {
+        const res = await fetch('/api/scan', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ subscription_id: subscriptionId })
@@ -406,86 +347,10 @@ async function renderGraph(subscriptionId) {
         cy.elements().remove();
         cy.add(currentGraph.elements);
 
-        // Custom layout: position resource groups in a grid,
-        // VNets in a row within each RG, subnets in a row within each VNet
-        const rgNodes = cy.nodes('[type="resource_group"]');
-        const cols = Math.ceil(Math.sqrt(rgNodes.length));
-        const subnetNodeWidth = 160;
-        const vnetPadding = 40;
-        const rgPadding = 60;
-        const rgGapX = 80;
-        const rgGapY = 80;
-
-        // First pass: calculate the width each RG needs
-        const rgSizes = [];
-        rgNodes.forEach(function(rg) {
-            const vnets = rg.children('[type="vnet"]');
-            let totalVnetWidth = 0;
-            vnets.forEach(function(vnet) {
-                const subCount = Math.max(vnet.children('[type="subnet"]').length, 1);
-                totalVnetWidth += subCount * subnetNodeWidth + vnetPadding * 2;
-            });
-            // Add gaps between VNets
-            totalVnetWidth += Math.max(vnets.length - 1, 0) * 40;
-            rgSizes.push({
-                width: totalVnetWidth + rgPadding * 2,
-                height: 250,
-            });
-        });
-
-        // Second pass: position everything
-        // Track column widths for grid alignment
-        const colWidths = [];
-        for (let c = 0; c < cols; c++) {
-            let maxW = 0;
-            for (let r = 0; r * cols + c < rgNodes.length; r++) {
-                maxW = Math.max(maxW, rgSizes[r * cols + c].width);
-            }
-            colWidths.push(maxW);
-        }
-
-        let cursorY = 0;
-        for (let r = 0; r * cols < rgNodes.length; r++) {
-            let cursorX = 0;
-            let rowHeight = 0;
-            for (let c = 0; c < cols && r * cols + c < rgNodes.length; c++) {
-                const idx = r * cols + c;
-                const rg = rgNodes[idx];
-                const rgCenterX = cursorX + colWidths[c] / 2;
-                const rgCenterY = cursorY + rgSizes[idx].height / 2;
-
-                // Position VNets left-to-right within RG
-                const vnets = rg.children('[type="vnet"]');
-                let vnetCursorX = rgCenterX - rgSizes[idx].width / 2 + rgPadding;
-
-                vnets.forEach(function(vnet) {
-                    const subnets = vnet.children('[type="subnet"]');
-                    const subCount = Math.max(subnets.length, 1);
-                    const vnetWidth = subCount * subnetNodeWidth + vnetPadding * 2;
-                    const vnetCenterX = vnetCursorX + vnetWidth / 2;
-
-                    vnet.position({ x: vnetCenterX, y: rgCenterY });
-
-                    // Position subnets in a row within VNet
-                    const totalSubW = (subnets.length - 1) * subnetNodeWidth;
-                    subnets.forEach(function(subnet, si) {
-                        subnet.position({
-                            x: vnetCenterX - totalSubW / 2 + si * subnetNodeWidth,
-                            y: rgCenterY,
-                        });
-                    });
-
-                    vnetCursorX += vnetWidth + 40;
-                });
-
-                cursorX += colWidths[c] + rgGapX;
-                rowHeight = Math.max(rowHeight, rgSizes[idx].height);
-            }
-            cursorY += rowHeight + rgGapY;
-        }
-
-        // Fit the view to all elements
-        cy.fit(cy.elements(), 50);
+        // Build the RG filter from this scan (everything selected), then let
+        // the filter lay the graph out and fit the view.
+        populateResourceGroupFilter();
+        applyResourceGroupFilter();
 
         // Update title with subscription name
         const subSelect = document.getElementById('subscriptionSelect');
@@ -493,17 +358,241 @@ async function renderGraph(subscriptionId) {
         document.getElementById('diagramTitle').textContent =
             `Topology for ${subName}`;
 
-        // Update info panel
-        const nodes = cy.nodes();
-        const edges = cy.edges();
         document.getElementById('infoSub').textContent = subscriptionId;
-        document.getElementById('infoNodes').textContent = nodes.length;
-        document.getElementById('infoEdges').textContent = edges.length;
         document.getElementById('graphInfo').style.display = 'block';
 
     } catch (e) {
         showStatus('scanStatus', `Render error: ${e.message}`, 'error');
     }
+}
+
+/**
+ * Lay out a set of resource groups: RGs in a grid, VNets in a row within each
+ * RG, subnets in a row within each VNet.
+ *
+ * Takes the collection to place rather than reading every RG off the graph, so
+ * the resource-group filter can re-pack only what is currently shown instead
+ * of leaving holes where the hidden RGs used to sit.
+ */
+function layoutTopology(rgNodes) {
+    const cols = Math.max(Math.ceil(Math.sqrt(rgNodes.length)), 1);
+    const subnetNodeWidth = 160;
+    const vnetPadding = 40;
+    const rgPadding = 60;
+    const rgGapX = 80;
+    const rgGapY = 80;
+
+    // First pass: calculate the width each RG needs
+    const rgSizes = [];
+    rgNodes.forEach(function(rg) {
+        const vnets = rg.children('[type="vnet"]');
+        let totalVnetWidth = 0;
+        vnets.forEach(function(vnet) {
+            const subCount = Math.max(vnet.children('[type="subnet"]').length, 1);
+            totalVnetWidth += subCount * subnetNodeWidth + vnetPadding * 2;
+        });
+        // Add gaps between VNets
+        totalVnetWidth += Math.max(vnets.length - 1, 0) * 40;
+        rgSizes.push({
+            width: totalVnetWidth + rgPadding * 2,
+            height: 250,
+        });
+    });
+
+    // Second pass: position everything
+    // Track column widths for grid alignment
+    const colWidths = [];
+    for (let c = 0; c < cols; c++) {
+        let maxW = 0;
+        for (let r = 0; r * cols + c < rgNodes.length; r++) {
+            maxW = Math.max(maxW, rgSizes[r * cols + c].width);
+        }
+        colWidths.push(maxW);
+    }
+
+    let cursorY = 0;
+    for (let r = 0; r * cols < rgNodes.length; r++) {
+        let cursorX = 0;
+        let rowHeight = 0;
+        for (let c = 0; c < cols && r * cols + c < rgNodes.length; c++) {
+            const idx = r * cols + c;
+            const rg = rgNodes[idx];
+            const rgCenterX = cursorX + colWidths[c] / 2;
+            const rgCenterY = cursorY + rgSizes[idx].height / 2;
+
+            // Position VNets left-to-right within RG
+            const vnets = rg.children('[type="vnet"]');
+            let vnetCursorX = rgCenterX - rgSizes[idx].width / 2 + rgPadding;
+
+            vnets.forEach(function(vnet) {
+                const subnets = vnet.children('[type="subnet"]');
+                const subCount = Math.max(subnets.length, 1);
+                const vnetWidth = subCount * subnetNodeWidth + vnetPadding * 2;
+                const vnetCenterX = vnetCursorX + vnetWidth / 2;
+
+                vnet.position({ x: vnetCenterX, y: rgCenterY });
+
+                // Position subnets in a row within VNet
+                const totalSubW = (subnets.length - 1) * subnetNodeWidth;
+                subnets.forEach(function(subnet, si) {
+                    subnet.position({
+                        x: vnetCenterX - totalSubW / 2 + si * subnetNodeWidth,
+                        y: rgCenterY,
+                    });
+                });
+
+                vnetCursorX += vnetWidth + 40;
+            });
+
+            cursorX += colWidths[c] + rgGapX;
+            rowHeight = Math.max(rowHeight, rgSizes[idx].height);
+        }
+        cursorY += rowHeight + rgGapY;
+    }
+}
+
+/**
+ * Rebuild the resource-group filter from the graph currently loaded.
+ *
+ * Every RG starts selected, so a fresh scan looks the way it always has.
+ */
+function populateResourceGroupFilter() {
+    allResourceGroups = cy.nodes('[type="resource_group"]')
+        .map(function(rg) { return rg.data('label'); })
+        .sort(function(a, b) { return a.localeCompare(b); });
+    selectedResourceGroups = new Set(allResourceGroups);
+
+    document.getElementById('rgSearch').value = '';
+    document.getElementById('rgFilterSection').style.display =
+        allResourceGroups.length > 0 ? 'block' : 'none';
+    renderResourceGroupList();
+}
+
+/**
+ * Render the checkbox list, narrowed to whatever the search box matches.
+ */
+function renderResourceGroupList() {
+    const list = document.getElementById('rgList');
+    const query = document.getElementById('rgSearch').value.trim().toLowerCase();
+    const shown = listedResourceGroups();
+
+    list.innerHTML = '';
+
+    if (shown.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'rg-empty';
+        empty.textContent = query
+            ? `No resource groups match "${query}"`
+            : 'No resource groups in this scan';
+        list.appendChild(empty);
+        return;
+    }
+
+    shown.forEach(function(name) {
+        const label = document.createElement('label');
+        label.className = 'rg-item';
+        label.title = name;
+
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = selectedResourceGroups.has(name);
+        box.addEventListener('change', function() {
+            if (box.checked) {
+                selectedResourceGroups.add(name);
+            } else {
+                selectedResourceGroups.delete(name);
+            }
+            applyResourceGroupFilter();
+        });
+
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(name));
+        list.appendChild(label);
+    });
+}
+
+/**
+ * The resource groups the list is currently showing (all of them, or just
+ * those matching the search box).
+ */
+function listedResourceGroups() {
+    const query = document.getElementById('rgSearch').value.trim().toLowerCase();
+    if (!query) return allResourceGroups;
+    return allResourceGroups.filter(function(name) {
+        return name.toLowerCase().includes(query);
+    });
+}
+
+/**
+ * Select-all / clear. Both act on the resource groups the list is showing, so
+ * a search plus "Select All" is a quick way to isolate a family of RGs.
+ */
+function setListedResourceGroups(selected) {
+    listedResourceGroups().forEach(function(name) {
+        if (selected) {
+            selectedResourceGroups.add(name);
+        } else {
+            selectedResourceGroups.delete(name);
+        }
+    });
+    renderResourceGroupList();
+    applyResourceGroupFilter();
+}
+
+/**
+ * Show only the selected resource groups, then re-pack and re-fit the view.
+ *
+ * Filtering is display-only: the full scan stays in memory, so toggling an RG
+ * back on costs nothing and never re-queries Azure. Hiding a node also hides
+ * its edges, which means a peering to a hidden VNet disappears — the status
+ * line reports how many, since a peering leaving the filtered set is usually
+ * the thing you actually want to know about.
+ */
+function applyResourceGroupFilter() {
+    if (!cy) return;
+
+    // Re-packing the canvas underneath an open drill-down would strand it.
+    if (drillDownActive) backToOverview();
+
+    const visibleRgs = cy.nodes('[type="resource_group"]').filter(function(rg) {
+        return selectedResourceGroups.has(rg.data('label'));
+    });
+    const hiddenRgs = cy.nodes('[type="resource_group"]').difference(visibleRgs);
+
+    visibleRgs.union(visibleRgs.descendants()).style('display', 'element');
+    hiddenRgs.union(hiddenRgs.descendants()).style('display', 'none');
+
+    if (visibleRgs.length > 0) {
+        layoutTopology(visibleRgs);
+        cy.fit(cy.elements(':visible'), 50);
+    }
+
+    updateGraphInfo();
+
+    const total = allResourceGroups.length;
+    const shownCount = visibleRgs.length;
+    const cutPeerings = cy.edges('[type="peered_to"]').length -
+        cy.edges('[type="peered_to"]:visible').length;
+
+    if (shownCount === 0) {
+        showStatus('rgStatus', 'No resource groups selected', 'error');
+    } else {
+        let msg = `Showing ${shownCount} of ${total} resource groups`;
+        if (cutPeerings > 0) {
+            msg += ` — ${cutPeerings} peering${cutPeerings === 1 ? '' : 's'} to hidden RGs`;
+        }
+        showStatus('rgStatus', msg, shownCount === total ? 'success' : 'info');
+    }
+}
+
+/**
+ * Refresh the info panel with what is actually on screen.
+ */
+function updateGraphInfo() {
+    document.getElementById('infoRgs').textContent =
+        `${cy.nodes('[type="resource_group"]:visible').length} of ${allResourceGroups.length}`;
+    document.getElementById('infoNodes').textContent = cy.nodes(':visible').length;
+    document.getElementById('infoEdges').textContent = cy.edges(':visible').length;
 }
 
 /**
@@ -534,7 +623,7 @@ async function drillDownToSubnet(subnetNode) {
     `;
 
     try {
-        const res = await authFetch('/api/subnet/resources', {
+        const res = await fetch('/api/subnet/resources', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -729,158 +818,13 @@ function backToOverview() {
     // Hide detail panel
     document.getElementById('detailSection').style.display = 'none';
 
-    // Zoom back to full view
+    // Zoom back to full view — filtered-out resource groups stay hidden.
     cy.animate({
-        fit: { eles: cy.elements(), padding: 50 },
+        fit: { eles: cy.elements(':visible'), padding: 50 },
         duration: 500,
     });
 
     drillDownActive = false;
-}
-
-/**
- * Escape a string for safe insertion into HTML (model output is untrusted).
- */
-function escapeHtml(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
-        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    }[c]));
-}
-
-/**
- * Ask Claude to review the current topology and render the findings.
- * Operates on the already-scanned graph held server-side, so no Azure token
- * is sent here.
- */
-async function analyzeTopology() {
-    const btn = document.getElementById('analyzeBtn');
-    const exportBtn = document.getElementById('exportBtn');
-    const panel = document.getElementById('findingsPanel');
-    panel.style.display = 'none';
-    panel.innerHTML = '';
-    exportBtn.style.display = 'none';
-    lastAnalysis = null;
-    btn.disabled = true;
-    showStatus('analyzeStatus', 'Analyzing topology with Claude…', 'loading');
-
-    try {
-        const res = await fetch('/api/analyze');
-        const data = await res.json();
-        if (!res.ok) {
-            throw new Error(data.error || 'Analysis failed');
-        }
-
-        lastAnalysis = data;
-        renderFindings(data);
-        exportBtn.style.display = 'block';
-        const n = (data.findings || []).length;
-        showStatus('analyzeStatus',
-            `Review complete: ${n} finding${n === 1 ? '' : 's'}`, 'success');
-    } catch (e) {
-        showStatus('analyzeStatus', `Error: ${e.message}`, 'error');
-    } finally {
-        btn.disabled = false;
-    }
-}
-
-/**
- * Export the most recent review as a Markdown report and trigger a download.
- */
-function exportFindings() {
-    if (!lastAnalysis) return;
-
-    const order = { high: 0, medium: 1, low: 2, info: 3 };
-    const findings = (lastAnalysis.findings || []).slice().sort(
-        (a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9)
-    );
-
-    const now = new Date();
-    const lines = [];
-    lines.push('# Azure Network Review');
-    lines.push('');
-    lines.push(`*Generated ${now.toLocaleString()} — ${findings.length} finding${findings.length === 1 ? '' : 's'}*`);
-    lines.push('');
-    if (lastAnalysis.summary) {
-        lines.push('## Summary');
-        lines.push('');
-        lines.push(lastAnalysis.summary);
-        lines.push('');
-    }
-
-    if (findings.length === 0) {
-        lines.push('No issues found.');
-    } else {
-        lines.push('## Findings');
-        lines.push('');
-        findings.forEach((f, i) => {
-            const sev = String(f.severity || 'info').toUpperCase();
-            lines.push(`### ${i + 1}. [${sev}] ${f.title || '(untitled)'}`);
-            lines.push('');
-            lines.push(`- **Category:** ${f.category || 'other'}`);
-            const resources = (f.affected_resources || []).join(', ');
-            if (resources) lines.push(`- **Affected:** ${resources}`);
-            lines.push('');
-            lines.push(f.finding || '');
-            lines.push('');
-            lines.push(`**Fix:** ${f.recommendation || ''}`);
-            lines.push('');
-        });
-    }
-
-    const stamp = now.toISOString().slice(0, 19).replace(/[:T]/g, '-');
-    downloadFile(`azure-network-review-${stamp}.md`, lines.join('\n'), 'text/markdown');
-}
-
-/**
- * Trigger a client-side file download for the given text content.
- */
-function downloadFile(filename, content, mime) {
-    const blob = new Blob([content], { type: `${mime};charset=utf-8` });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-}
-
-/**
- * Render the structured review into the sidebar.
- */
-function renderFindings(data) {
-    const panel = document.getElementById('findingsPanel');
-    const order = { high: 0, medium: 1, low: 2, info: 3 };
-
-    let html = '';
-    if (data.summary) {
-        html += `<div class="analysis-summary">${escapeHtml(data.summary)}</div>`;
-    }
-
-    const findings = (data.findings || []).slice().sort(
-        (a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9)
-    );
-
-    if (findings.length === 0) {
-        html += `<div class="status success" style="display:block;">No issues found.</div>`;
-    }
-
-    findings.forEach(f => {
-        const sev = String(f.severity || 'info').toLowerCase();
-        const resources = (f.affected_resources || []).join(', ');
-        html += `
-            <div class="finding ${escapeHtml(sev)}">
-                <div class="sev">${escapeHtml(sev)} &middot; ${escapeHtml(f.category || '')}</div>
-                <div class="ftitle">${escapeHtml(f.title || '')}</div>
-                <div class="fbody">${escapeHtml(f.finding || '')}</div>
-                <div class="frec"><strong>Fix:</strong> ${escapeHtml(f.recommendation || '')}</div>
-                ${resources ? `<div class="fres">Affected: ${escapeHtml(resources)}</div>` : ''}
-            </div>`;
-    });
-
-    panel.innerHTML = html;
-    panel.style.display = 'block';
 }
 
 /**
@@ -892,12 +836,11 @@ async function clearGraph() {
         if (cy) {
             cy.elements().remove();
         }
+        allResourceGroups = [];
+        selectedResourceGroups = new Set();
+        document.getElementById('rgFilterSection').style.display = 'none';
+        document.getElementById('rgStatus').style.display = 'none';
         document.getElementById('graphInfo').style.display = 'none';
-        document.getElementById('findingsPanel').style.display = 'none';
-        document.getElementById('findingsPanel').innerHTML = '';
-        document.getElementById('analyzeStatus').style.display = 'none';
-        document.getElementById('exportBtn').style.display = 'none';
-        lastAnalysis = null;
         showStatus('scanStatus', 'Graph cleared', 'success');
     } catch (e) {
         showStatus('scanStatus', `Error: ${e.message}`, 'error');
@@ -908,13 +851,5 @@ async function clearGraph() {
  * Initialize on page load
  */
 document.addEventListener('DOMContentLoaded', () => {
-    // Initialize MSAL
-    msalInstance = new msal.PublicClientApplication(msalConfig);
-
-    // Check if already signed in (e.g. after redirect)
-    const accounts = msalInstance.getAllAccounts();
-    if (accounts.length > 0) {
-        updateAuthUI(accounts[0]);
-        showStatus('authStatus', 'Signed in', 'success');
-    }
+    checkIdentity();
 });

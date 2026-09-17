@@ -1,10 +1,22 @@
 services:
   azure-mapper:
-    build: .
+    build:
+      context: .
+      args:
+        # Set to "true" to reuse a host `az login` session (also uncomment the
+        # ~/.azure mount below). Managed-identity hosts don't need this.
+        WITH_AZURE_CLI: "false"
     ports:
-      - "8080:8080"
+      # Bound to loopback: the app acts as the host's Azure identity and has no
+      # sign-in of its own, so don't expose it on the network. Reach a remote
+      # VM with: ssh -L 8080:localhost:8080 <vm>
+      - "127.0.0.1:8080:8080"
     env_file:
-      - app/.env
-    environment:
-      FLASK_ENV: development
+      # Optional — the app runs with no .env at all when the host has a managed
+      # identity or an az login session.
+      - path: app/.env
+        required: false
+    # volumes:
+    #   # Reuse the host's `az login` session (needs WITH_AZURE_CLI=true above).
+    #   - ${HOME}/.azure:/root/.azure:ro
     restart: unless-stopped

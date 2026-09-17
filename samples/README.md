@@ -9,7 +9,7 @@ The sample deploys:
 - **Resource Group**: `SAMPLE-RG` in the `eastus` region
 - **Virtual Network 1 (SAMPLE-VNET01)**: `172.19.100.0/22`
   - Subnet 1 (SAMPLE-VNET01-SUB01): `172.19.101.0/24`
-  - Subnet 2 (SAMPLE-VNET-SUB02): `172.19.102.0/24`
+  - Subnet 2 (SAMPLE-VNET01-SUB02): `172.19.102.0/24`
 - **Virtual Network 2 (SAMPLE-VNET02)**: `172.19.200.0/22`
   - Subnet 1 (SAMPLE-VNET02-SUB01): `172.19.201.0/24`
 - **VNet Peering**: Bidirectional peering between SAMPLE-VNET01 and SAMPLE-VNET02

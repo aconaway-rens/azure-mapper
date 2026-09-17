@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Azure Mapper</title>
-    <script src="https://alcdn.msauth.net/browser/2.32.2/js/msal-browser.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+    <script src="{{ url_for('static', filename='vendor/cytoscape.min.js') }}"></script>
     <style>
         * {
             margin: 0;
@@ -203,70 +202,57 @@
             background: #555;
         }
 
-        /* AI Network Review findings */
-        .analysis-summary {
+        .filter-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .filter-actions button {
+            flex: 1;
+            padding: 6px;
             font-size: 12px;
+            background: #eee;
             color: #333;
-            background: #eef6ff;
-            border: 1px solid #cfe4fb;
-            padding: 8px;
+        }
+
+        .filter-actions button:hover {
+            background: #ddd;
+        }
+
+        .rg-list {
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #ddd;
             border-radius: 4px;
+            padding: 6px;
             margin-bottom: 8px;
-            line-height: 1.5;
         }
 
-        .finding {
-            background: #fff;
-            border: 1px solid #eee;
-            border-left: 4px solid #999;
-            padding: 8px;
-            margin-bottom: 8px;
-            border-radius: 4px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-        }
-
-        .finding.high { border-left-color: #d13438; }
-        .finding.medium { border-left-color: #f7630c; }
-        .finding.low { border-left-color: #ffb900; }
-        .finding.info { border-left-color: #0078d4; }
-
-        .finding .sev {
-            font-size: 10px;
-            font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #777;
-        }
-        .finding.high .sev { color: #d13438; }
-        .finding.medium .sev { color: #c2500a; }
-        .finding.low .sev { color: #9a7000; }
-        .finding.info .sev { color: #0078d4; }
-
-        .finding .ftitle {
-            font-weight: 600;
+        .rg-item {
+            display: flex;
+            align-items: center;
             font-size: 12px;
-            margin: 2px 0 4px;
-            color: #222;
+            padding: 3px 2px;
+            cursor: pointer;
+            word-break: break-all;
         }
 
-        .finding .fbody {
-            font-size: 11px;
-            color: #444;
-            line-height: 1.5;
+        .rg-item:hover {
+            background: #f0f6fc;
         }
 
-        .finding .frec {
-            font-size: 11px;
-            color: #155724;
-            margin-top: 4px;
+        .rg-item input {
+            width: auto;
+            margin: 0 8px 0 0;
+            flex-shrink: 0;
         }
 
-        .finding .fres {
-            font-size: 10px;
-            color: #777;
-            margin-top: 4px;
-            word-break: break-word;
+        .rg-empty {
+            font-size: 12px;
+            color: #888;
+            padding: 4px 2px;
         }
+
     </style>
 </head>
 <body>
@@ -274,9 +260,8 @@
         <div class="sidebar">
             <div class="section">
                 <h3>Azure Mapper</h3>
-                <div id="authStatus" class="status">Not signed in</div>
-                <button id="authBtn" onclick="signIn()">Sign In with Microsoft</button>
-                <div id="userName" style="display:none; font-size:12px; color:#333; margin-bottom:8px;"></div>
+                <div id="authStatus" class="status">Checking Azure credential…</div>
+                <div id="tenantInfo" style="display:none; font-size:11px; color:#777; margin-bottom:8px; word-break:break-all;"></div>
             </div>
 
             <div class="section">
@@ -294,6 +279,18 @@
                 <div id="scanStatus" class="status" style="display:none;"></div>
             </div>
 
+            <div class="section" id="rgFilterSection" style="display:none;">
+                <h3>Resource Groups</h3>
+                <div class="filter-actions">
+                    <button onclick="setListedResourceGroups(true)">Select All</button>
+                    <button onclick="setListedResourceGroups(false)">Clear</button>
+                </div>
+                <input type="text" id="rgSearch" placeholder="Search resource groups…"
+                       oninput="renderResourceGroupList()">
+                <div id="rgList" class="rg-list"></div>
+                <div id="rgStatus" class="status" style="display:none;"></div>
+            </div>
+
             <div class="section" id="detailSection" style="display:none;">
                 <h3>Subnet Detail</h3>
                 <button class="back-btn" onclick="backToOverview()">Back to Overview</button>
@@ -302,17 +299,10 @@
             </div>
 
             <div class="section">
-                <h3>AI Network Review</h3>
-                <button onclick="analyzeTopology()" id="analyzeBtn">Review with Claude</button>
-                <div id="analyzeStatus" class="status" style="display:none;"></div>
-                <div id="findingsPanel" style="display:none;"></div>
-                <button onclick="exportFindings()" id="exportBtn" style="display:none;">Export findings (.md)</button>
-            </div>
-
-            <div class="section">
                 <h3>Graph Info</h3>
                 <div id="graphInfo" class="info-panel" style="display:none;">
                     <strong>Subscription:</strong><br><span id="infoSub"></span><br><br>
+                    <strong>Resource Groups:</strong><br><span id="infoRgs">0</span><br><br>
                     <strong>Nodes:</strong><br><span id="infoNodes">0</span><br><br>
                     <strong>Edges:</strong><br><span id="infoEdges">0</span>
                 </div>

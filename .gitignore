@@ -29,6 +29,7 @@ Thumbs.db
 .terraform/
 *.tfstate
 *.tfstate.backup
+*.tfstate.lock.info
 .terraform.lock.hcl
 
 # App artifacts
