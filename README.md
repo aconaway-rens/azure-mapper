@@ -37,21 +37,21 @@ Azure Mapper ships as source you build yourself — there's no published package
 or container image. Clone the latest release:
 
 ```bash
-git clone --depth 1 --branch v1.0.0 https://github.com/aconaway-rens/azure-mapper.git
+git clone --depth 1 --branch v1.0.1 https://github.com/aconaway-rens/azure-mapper.git
 cd azure-mapper
 ```
 
 Or, without git, download the release tarball:
 
 ```bash
-curl -L https://github.com/aconaway-rens/azure-mapper/archive/refs/tags/v1.0.0.tar.gz | tar xz
-cd azure-mapper-1.0.0
+curl -L https://github.com/aconaway-rens/azure-mapper/archive/refs/tags/v1.0.1.tar.gz | tar xz
+cd azure-mapper-1.0.1
 ```
 
 Both give you the same tree with Cytoscape.js vendored in, so the build pulls
 nothing from the internet beyond GitHub itself and PyPI. See the
 [releases page](https://github.com/aconaway-rens/azure-mapper/releases) for the
-current version — substitute it for `v1.0.0` above, or drop `--branch v1.0.0`
+current version — substitute it for `v1.0.1` above, or drop `--branch v1.0.1`
 to track `main`.
 
 To move a clone to a newer release later:
