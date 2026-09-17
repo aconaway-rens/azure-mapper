@@ -283,7 +283,10 @@ function topologyStyles() {
                     'text-margin-y': -6,
                     'font-size': 11,
                     'font-weight': 'bold',
-                    'color': '#fff',
+                    // The caption renders above the box, against the VNet's
+                    // pale background rather than the node's purple — white
+                    // here is invisible.
+                    'color': '#4b3b7a',
                     'padding': '10px',
                     'background-opacity': 0.9,
                 }
@@ -512,11 +515,17 @@ function layoutTopology(rgNodes) {
         });
 
         // A VM spanning subnets is a child of the VNet, not of any subnet. It
-        // goes in a row underneath them, so its NIC links run down into the
-        // subnets it reaches rather than across the diagram.
+        // goes in a row underneath them, centred on the subnet row rather than
+        // left-justified: its links reach across every subnet it serves, so
+        // starting from the left corner drags them all diagonally across the
+        // diagram instead of letting them fan out evenly.
         const spanning = vnet.children('[type="vm"]');
         if (spanning.length > 0) {
-            let vmX = x + VNET_PAD;
+            const subnetRowWidth = Math.max(subnetX - SUBNET_GAP - (x + VNET_PAD), 0);
+            const vmRowWidth = spanning.length * CARD_W +
+                (spanning.length - 1) * CARD_GAP;
+
+            let vmX = x + VNET_PAD + (subnetRowWidth - vmRowWidth) / 2;
             const rowY = subnetBottom + SPANNING_VM_GAP;
             spanning.forEach(function(vm) {
                 placeCard(vm, vmX + CARD_W / 2, rowY + CARD_H / 2);

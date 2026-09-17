@@ -236,6 +236,21 @@ class AzureResourceIngestor:
         )
         return {"nics": nics, "vms": vms}
 
+    @staticmethod
+    def _os_type_name(vm: Any) -> str:
+        """The VM's OS as a plain word.
+
+        The SDK hands back an enum whose str() is ``OperatingSystemTypes.LINUX``
+        — accurate, and not what anyone wants printed on a diagram.
+        """
+        profile = getattr(vm, "storage_profile", None)
+        os_disk = getattr(profile, "os_disk", None) if profile else None
+        os_type = getattr(os_disk, "os_type", None) if os_disk else None
+        if not os_type:
+            return ""
+        name = getattr(os_type, "value", None) or str(os_type).split(".")[-1]
+        return name.capitalize()
+
     def get_nics_and_vms(self, subscription_id: str) -> Dict[str, Any]:
         """Fetch every NIC in the subscription, resolved to its VM and subnet.
 
@@ -265,12 +280,7 @@ class AzureResourceIngestor:
                 "vm_size": (
                     vm.hardware_profile.vm_size if vm.hardware_profile else ""
                 ),
-                "os_type": str(
-                    vm.storage_profile.os_disk.os_type
-                    if vm.storage_profile and vm.storage_profile.os_disk
-                    and vm.storage_profile.os_disk.os_type
-                    else ""
-                ),
+                "os_type": self._os_type_name(vm),
             }
 
         nics: List[Dict[str, Any]] = []
