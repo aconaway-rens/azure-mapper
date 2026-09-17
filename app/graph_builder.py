@@ -72,9 +72,23 @@ class TopologyGraph:
         return edge
 
     def build_from_azure_scan(self, scan_data: Dict[str, Any]) -> None:
-        """Build graph from Azure scan data (VNets, subnets, peerings)."""
+        """Build graph from Azure scan data (VNets, subnets, peerings, VMs).
+
+        VM and NIC nodes are always built when the scan carries them. Whether
+        they are *drawn* is the frontend's call — it collapses subnets busier
+        than the render limit down to a click-to-drill-in summary. Holding the
+        whole tree here means changing that limit re-renders instantly rather
+        than forcing a rescan.
+        """
         vnets = scan_data.get("vnets", {})
         peerings = scan_data.get("peerings", [])
+
+        # Index NIC attachments by the subnet they land on. ARM IDs vary in
+        # case between resources, so the ingest lowercases these keys.
+        nics_by_subnet: Dict[str, List[Dict[str, Any]]] = {}
+        for nic in scan_data.get("nics", []):
+            nics_by_subnet.setdefault(nic["subnet_id"], []).append(nic)
+        vms_by_id = scan_data.get("vms", {})
 
         # Track resource groups so we create each one only once
         resource_groups = set()
@@ -117,15 +131,31 @@ class TopologyGraph:
                     f"{subnet['name']}\n{addr}" if addr
                     else subnet["name"]
                 )
+                subnet_node_id = f"subnet_{vnet_name}_{subnet['name']}"
+                subnet_nics = nics_by_subnet.get(
+                    (subnet["id"] or "").lower(), []
+                )
+                vm_ids = {
+                    n["vm_id"].lower() for n in subnet_nics if n.get("vm_id")
+                }
+
                 self.add_node(
-                    f"subnet_{vnet_name}_{subnet['name']}",
+                    subnet_node_id,
                     "subnet",
                     subnet_label,
                     parent=vnet_id,
                     data={
                         "azure_id": subnet["id"],
                         "address_prefix": addr,
+                        # The frontend marks and collapses on these, so they
+                        # stay accurate even when the children aren't drawn.
+                        "nic_count": len(subnet_nics),
+                        "vm_count": len(vm_ids),
                     },
+                )
+
+                self._add_subnet_workloads(
+                    subnet_node_id, subnet_nics, vms_by_id
                 )
 
         # Create peering edges
@@ -147,6 +177,64 @@ class TopologyGraph:
                         ),
                         "peering_name": peering.get("name"),
                     })
+
+    def _add_subnet_workloads(
+        self,
+        subnet_node_id: str,
+        subnet_nics: List[Dict[str, Any]],
+        vms_by_id: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Add the VM and NIC nodes living inside one subnet.
+
+        A VM becomes a compound node holding one detail child (size, OS, and
+        its IPs on this subnet), matching what the subnet drill-down has always
+        drawn. A NIC with no VM attached is drawn on its own, since an orphaned
+        NIC is usually worth noticing.
+        """
+        vm_nics: Dict[str, List[Dict[str, Any]]] = {}
+        for nic in subnet_nics:
+            if nic.get("vm_id"):
+                vm_nics.setdefault(nic["vm_id"].lower(), []).append(nic)
+            else:
+                self.add_node(
+                    f"nic_{subnet_node_id}_{nic['name']}",
+                    "nic",
+                    f"{nic['name']}\n{nic.get('private_ip') or 'no IP'}",
+                    parent=subnet_node_id,
+                    data={
+                        "azure_id": nic["id"],
+                        "private_ip": nic.get("private_ip"),
+                        "orphan": True,
+                    },
+                )
+
+        for vm_id, nics in vm_nics.items():
+            vm = vms_by_id.get(vm_id, {})
+            vm_name = vm.get("name") or nics[0].get("vm_name") or "unknown-vm"
+            vm_node_id = f"vm_{subnet_node_id}_{vm_name}"
+            ips = ", ".join(n.get("private_ip") or "?" for n in nics)
+
+            self.add_node(
+                vm_node_id, "vm", vm_name,
+                parent=subnet_node_id,
+                data={
+                    "azure_id": vm.get("id") or vm_id,
+                    "vm_size": vm.get("vm_size", ""),
+                    "os_type": vm.get("os_type", ""),
+                    "private_ips": ips,
+                    "nic_names": [n["name"] for n in nics],
+                },
+            )
+
+            detail = [p for p in (
+                vm.get("vm_size"), vm.get("os_type"), ips,
+            ) if p]
+            self.add_node(
+                f"{vm_node_id}_detail", "vm_detail",
+                "\n".join(detail),
+                parent=vm_node_id,
+                data={},
+            )
 
     def to_cytoscape_format(self) -> Dict[str, List[Dict[str, Any]]]:
         """Export graph in Cytoscape.js format.

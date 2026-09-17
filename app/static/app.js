@@ -6,6 +6,21 @@ let cy = null;
 let currentGraph = null;
 let drillDownActive = false;
 
+// How many NICs a subnet may hold before its VM/NIC cards stop being drawn
+// inline. A subscription with fifty VMs behind one subnet is unreadable drawn
+// flat, so past this point the subnet collapses to a marked summary you click
+// into. The cards stay in the graph either way.
+const DEFAULT_RENDER_LIMIT = 10;
+const WORKLOAD_TYPES = ['vm', 'vm_detail', 'nic'];
+
+let renderLimit = DEFAULT_RENDER_LIMIT;
+// Subnets expanded by an explicit drill-down, overriding the limit.
+let expandedSubnets = new Set();
+// Workload cards per subnet, held aside so a collapsed subnet can drop its
+// contents from the graph entirely and get them back without a rescan.
+let workloadsBySubnet = {};
+let totalVmCount = 0;
+
 // Resource-group filter state. `allResourceGroups` is every RG in the current
 // scan; `selectedResourceGroups` is the subset drawn on the canvas. The Set is
 // the source of truth rather than the checkboxes, because the list is
@@ -49,7 +64,22 @@ function initializeCytoscape() {
 
     cy = cytoscape({
         container: document.getElementById('cy'),
-        style: [
+        style: topologyStyles(),
+        layout: { name: 'preset' }
+    });
+
+    // Click a subnet to drill down into its resources
+    cy.on('tap', 'node[type="subnet"]', function(evt) {
+        drillDownToSubnet(evt.target);
+    });
+}
+
+/**
+ * The topology stylesheet, kept separate from the Cytoscape instance so the
+ * same rules can be applied when the graph is driven outside a browser.
+ */
+function topologyStyles() {
+    return [
             // Default node style
             {
                 selector: 'node',
@@ -102,10 +132,11 @@ function initializeCytoscape() {
                 }
             },
             // Subnet: solid rounded rectangle inside VNet
-            // When it has children (drill-down), it becomes a compound node
+            // When its workloads are drawn, it becomes a compound node
             {
                 selector: 'node[type="subnet"]',
                 style: {
+                    'label': subnetLabel,
                     'shape': 'roundrectangle',
                     'background-color': '#50e6ff',
                     'border-color': '#0078d4',
@@ -118,7 +149,7 @@ function initializeCytoscape() {
                     'text-max-width': '130px',
                 }
             },
-            // Subnet when it has children (drill-down active)
+            // Subnet drawn as a container, once its workloads are in it
             {
                 selector: 'node[type="subnet"]:parent',
                 style: {
@@ -129,8 +160,33 @@ function initializeCytoscape() {
                     'font-weight': 'bold',
                     'padding': '20px',
                     'background-opacity': 0.5,
-                    'width': 'auto',
-                    'height': 'auto',
+                }
+            },
+            // A subnet holding workloads, marked whether or not its cards are
+            // drawn — this is what makes a collapsed subnet findable.
+            {
+                selector: 'node[type="subnet"][?nic_count]',
+                style: {
+                    'border-color': '#8661c5',
+                    'border-width': 2,
+                }
+            },
+            // Collapsed: the cards exist but aren't drawn. Overrides the
+            // container styling above, since there's nothing inside to size to.
+            {
+                selector: 'node[type="subnet"][?collapsed]',
+                style: {
+                    'width': 165,
+                    'height': 72,
+                    'padding': 0,
+                    'text-valign': 'center',
+                    'text-margin-y': 0,
+                    'font-size': 9,
+                    'font-weight': 'normal',
+                    'background-color': '#b9a3e0',
+                    'background-opacity': 1,
+                    'border-style': 'dashed',
+                    'border-width': 3,
                 }
             },
             // Edges
@@ -238,15 +294,29 @@ function initializeCytoscape() {
                     'target-arrow-color': '#ff6b6b',
                 }
             }
-        ],
-        layout: { name: 'preset' }
-    });
+    ];
+}
 
-    // Click a subnet to drill down into its resources
-    cy.on('tap', 'node[type="subnet"]', function(evt) {
-        const node = evt.target;
-        drillDownToSubnet(node);
-    });
+/**
+ * Subnet caption: name, CIDR, and what lives inside it.
+ *
+ * The workload line is what marks a subnet as holding VMs — it's the only clue
+ * a collapsed subnet gives about what it's hiding, so it carries the counts
+ * rather than a bare "has VMs".
+ */
+function subnetLabel(ele) {
+    const data = ele.data();
+    const vms = data.vm_count || 0;
+    const nics = data.nic_count || 0;
+    if (nics === 0) return data.label;
+
+    const parts = [];
+    if (vms > 0) parts.push(`${vms} VM${vms === 1 ? '' : 's'}`);
+    parts.push(`${nics} NIC${nics === 1 ? '' : 's'}`);
+
+    let text = `${data.label}\n${parts.join(' · ')}`;
+    if (data.collapsed) text += '\nclick to expand';
+    return text;
 }
 
 /**
@@ -347,6 +417,9 @@ async function renderGraph(subscriptionId) {
         cy.elements().remove();
         cy.add(currentGraph.elements);
 
+        // Index the workload cards before anything asks to draw them.
+        indexWorkloads(currentGraph.elements);
+
         // Build the RG filter from this scan (everything selected), then let
         // the filter lay the graph out and fit the view.
         populateResourceGroupFilter();
@@ -360,95 +433,121 @@ async function renderGraph(subscriptionId) {
 
         document.getElementById('infoSub').textContent = subscriptionId;
         document.getElementById('graphInfo').style.display = 'block';
+        document.getElementById('limitSection').style.display = 'block';
+        reportCollapsed();
 
     } catch (e) {
         showStatus('scanStatus', `Render error: ${e.message}`, 'error');
     }
 }
 
+
 /**
- * Lay out a set of resource groups: RGs in a grid, VNets in a row within each
- * RG, subnets in a row within each VNet.
+ * Lay out the topology: resource groups in a grid, VNets in a row inside each
+ * RG, subnets in a row inside each VNet, and VM/NIC cards in a grid inside
+ * each subnet.
  *
- * Takes the collection to place rather than reading every RG off the graph, so
- * the resource-group filter can re-pack only what is currently shown instead
- * of leaving holes where the hidden RGs used to sit.
+ * Only leaf nodes are positioned. Cytoscape sizes a compound node from its
+ * children, so position() on a VNet — or on a subnet that has cards in it — is
+ * silently ignored; those containers take their size from what's inside them.
+ * Each container is therefore measured after its contents land, so a subnet
+ * holding twelve VMs pushes its neighbours along instead of overlapping them.
  */
 function layoutTopology(rgNodes) {
+    const RG_GAP_X = 90, RG_GAP_Y = 90, RG_PAD = 45;
+    const VNET_GAP = 45, VNET_PAD = 32;
+    const SUBNET_GAP = 30, SUBNET_PAD = 24, SUBNET_TITLE_H = 38;
+    const CARD_W = 185, CARD_H = 80, CARD_GAP = 16;
+
     const cols = Math.max(Math.ceil(Math.sqrt(rgNodes.length)), 1);
-    const subnetNodeWidth = 160;
-    const vnetPadding = 40;
-    const rgPadding = 60;
-    const rgGapX = 80;
-    const rgGapY = 80;
+    let cursorY = 0, idx = 0;
 
-    // First pass: calculate the width each RG needs
-    const rgSizes = [];
-    rgNodes.forEach(function(rg) {
-        const vnets = rg.children('[type="vnet"]');
-        let totalVnetWidth = 0;
-        vnets.forEach(function(vnet) {
-            const subCount = Math.max(vnet.children('[type="subnet"]').length, 1);
-            totalVnetWidth += subCount * subnetNodeWidth + vnetPadding * 2;
-        });
-        // Add gaps between VNets
-        totalVnetWidth += Math.max(vnets.length - 1, 0) * 40;
-        rgSizes.push({
-            width: totalVnetWidth + rgPadding * 2,
-            height: 250,
-        });
-    });
-
-    // Second pass: position everything
-    // Track column widths for grid alignment
-    const colWidths = [];
-    for (let c = 0; c < cols; c++) {
-        let maxW = 0;
-        for (let r = 0; r * cols + c < rgNodes.length; r++) {
-            maxW = Math.max(maxW, rgSizes[r * cols + c].width);
+    while (idx < rgNodes.length) {
+        let cursorX = 0, rowHeight = 0;
+        for (let c = 0; c < cols && idx < rgNodes.length; c++, idx++) {
+            const size = layoutResourceGroup(rgNodes[idx], cursorX, cursorY);
+            cursorX += size.w + RG_GAP_X;
+            rowHeight = Math.max(rowHeight, size.h);
         }
-        colWidths.push(maxW);
+        cursorY += rowHeight + RG_GAP_Y;
     }
 
-    let cursorY = 0;
-    for (let r = 0; r * cols < rgNodes.length; r++) {
-        let cursorX = 0;
-        let rowHeight = 0;
-        for (let c = 0; c < cols && r * cols + c < rgNodes.length; c++) {
-            const idx = r * cols + c;
-            const rg = rgNodes[idx];
-            const rgCenterX = cursorX + colWidths[c] / 2;
-            const rgCenterY = cursorY + rgSizes[idx].height / 2;
+    function layoutResourceGroup(rg, x, y) {
+        let vnetX = x + RG_PAD;
+        rg.children('[type="vnet"]').forEach(function(vnet) {
+            vnetX += layoutVnet(vnet, vnetX, y + RG_PAD).w + VNET_GAP;
+        });
+        return alignAndMeasure(rg, x, y);
+    }
 
-            // Position VNets left-to-right within RG
-            const vnets = rg.children('[type="vnet"]');
-            let vnetCursorX = rgCenterX - rgSizes[idx].width / 2 + rgPadding;
+    function layoutVnet(vnet, x, y) {
+        let subnetX = x + VNET_PAD;
+        vnet.children('[type="subnet"]').forEach(function(subnet) {
+            subnetX += layoutSubnet(subnet, subnetX, y + VNET_PAD).w + SUBNET_GAP;
+        });
+        return alignAndMeasure(vnet, x, y);
+    }
 
-            vnets.forEach(function(vnet) {
-                const subnets = vnet.children('[type="subnet"]');
-                const subCount = Math.max(subnets.length, 1);
-                const vnetWidth = subCount * subnetNodeWidth + vnetPadding * 2;
-                const vnetCenterX = vnetCursorX + vnetWidth / 2;
+    function layoutSubnet(subnet, x, y) {
+        const cards = subnet.children(':visible');
 
-                vnet.position({ x: vnetCenterX, y: rgCenterY });
+        // Empty or collapsed: a plain box, positioned directly. Its real
+        // height varies with how many caption lines it carries, so measure
+        // rather than assume.
+        if (cards.length === 0) return alignAndMeasure(subnet, x, y);
 
-                // Position subnets in a row within VNet
-                const totalSubW = (subnets.length - 1) * subnetNodeWidth;
-                subnets.forEach(function(subnet, si) {
-                    subnet.position({
-                        x: vnetCenterX - totalSubW / 2 + si * subnetNodeWidth,
-                        y: rgCenterY,
-                    });
-                });
+        const cols = Math.max(1, Math.ceil(Math.sqrt(cards.length)));
+        cards.forEach(function(card, i) {
+            placeCard(
+                card,
+                x + SUBNET_PAD + (i % cols) * (CARD_W + CARD_GAP) + CARD_W / 2,
+                y + SUBNET_TITLE_H + Math.floor(i / cols) * (CARD_H + CARD_GAP) + CARD_H / 2
+            );
+        });
+        return alignAndMeasure(subnet, x, y);
+    }
 
-                vnetCursorX += vnetWidth + 40;
+    function placeCard(card, x, y) {
+        // A VM is itself a compound (name on top, detail child inside), so its
+        // box comes from the child. A bare NIC is a leaf and moves directly.
+        const inner = card.children();
+        if (inner.length > 0) {
+            inner.forEach(function(ch) { ch.position({ x: x, y: y }); });
+        } else {
+            card.position({ x: x, y: y });
+        }
+    }
+
+    /**
+     * Move a container so its top-left corner sits exactly at (x, y), then
+     * report its size. Compound padding and label overhang mean a container
+     * spreads beyond the cards inside it; without this correction those few
+     * pixels accumulate and neighbours start to touch.
+     */
+    function alignAndMeasure(ele, x, y) {
+        let bb = ele.boundingBox();
+        const dx = x - bb.x1, dy = y - bb.y1;
+
+        if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
+            const movable = ele.isChildless()
+                ? ele
+                : ele.descendants().filter(function(n) { return n.isChildless(); });
+            movable.forEach(function(n) {
+                const p = n.position();
+                n.position({ x: p.x + dx, y: p.y + dy });
             });
-
-            cursorX += colWidths[c] + rgGapX;
-            rowHeight = Math.max(rowHeight, rgSizes[idx].height);
+            bb = ele.boundingBox();
         }
-        cursorY += rowHeight + rgGapY;
+        return { w: bb.w, h: bb.h };
     }
+}
+
+/**
+ * Re-pack and re-fit whatever is currently visible.
+ */
+function layoutVisible() {
+    const visibleRgs = cy.nodes('[type="resource_group"]:visible');
+    if (visibleRgs.length > 0) layoutTopology(visibleRgs);
 }
 
 /**
@@ -539,6 +638,7 @@ function setListedResourceGroups(selected) {
     applyResourceGroupFilter();
 }
 
+
 /**
  * Show only the selected resource groups, then re-pack and re-fit the view.
  *
@@ -554,23 +654,14 @@ function applyResourceGroupFilter() {
     // Re-packing the canvas underneath an open drill-down would strand it.
     if (drillDownActive) backToOverview();
 
-    const visibleRgs = cy.nodes('[type="resource_group"]').filter(function(rg) {
-        return selectedResourceGroups.has(rg.data('label'));
-    });
-    const hiddenRgs = cy.nodes('[type="resource_group"]').difference(visibleRgs);
-
-    visibleRgs.union(visibleRgs.descendants()).style('display', 'element');
-    hiddenRgs.union(hiddenRgs.descendants()).style('display', 'none');
-
-    if (visibleRgs.length > 0) {
-        layoutTopology(visibleRgs);
-        cy.fit(cy.elements(':visible'), 50);
-    }
+    applyVisibility();
+    layoutVisible();
+    if (cy.nodes(':visible').length > 0) cy.fit(cy.elements(':visible'), 50);
 
     updateGraphInfo();
 
     const total = allResourceGroups.length;
-    const shownCount = visibleRgs.length;
+    const shownCount = cy.nodes('[type="resource_group"]:visible').length;
     const cutPeerings = cy.edges('[type="peered_to"]').length -
         cy.edges('[type="peered_to"]:visible').length;
 
@@ -586,6 +677,153 @@ function applyResourceGroupFilter() {
 }
 
 /**
+ * Decide what gets drawn: the resource-group filter first, then per-subnet
+ * workload collapsing.
+ *
+ * A subnet holding more NICs than the render limit keeps its VM and NIC cards
+ * out of the graph, so a subscription with fifty VMs behind one subnet still
+ * renders as a diagram you can read. The subnet is still marked as holding
+ * workloads, and drilling into it puts the cards back.
+ */
+function applyVisibility() {
+    cy.nodes('[type="subnet"]').forEach(function(subnet) {
+        subnet.data('collapsed', isSubnetCollapsed(subnet));
+    });
+
+    syncWorkloadCards();
+
+    cy.nodes('[type="resource_group"]').forEach(function(rg) {
+        const visible = selectedResourceGroups.has(rg.data('label'));
+        rg.style('display', visible ? 'element' : 'none');
+        rg.descendants().style('display', visible ? 'element' : 'none');
+    });
+}
+
+/**
+ * Add or remove each subnet's workload cards to match the collapse decision.
+ *
+ * Collapsing removes the cards rather than hiding them, because Cytoscape
+ * sizes and positions a compound node from its children: a subnet whose
+ * children were merely display:none would shrink to a stub the layout can
+ * neither measure nor move. Removing them makes it an ordinary box again, and
+ * the definitions live in `workloadsBySubnet` so putting them back is free.
+ */
+function syncWorkloadCards() {
+    cy.nodes('[type="subnet"]').forEach(function(subnet) {
+        const shouldDraw = !isSubnetCollapsed(subnet);
+        const present = subnet.children().length > 0;
+
+        if (shouldDraw && !present) {
+            const cards = workloadsBySubnet[subnet.id()] || [];
+            // Clone, so re-adding the same subnet later isn't affected by
+            // whatever Cytoscape did to the previous copy.
+            cy.add(cards.map(function(card) {
+                return { data: Object.assign({}, card.data) };
+            }));
+        } else if (!shouldDraw && present) {
+            subnet.descendants().remove();
+        }
+    });
+}
+
+/**
+ * Group the scan's VM and NIC cards by the subnet they belong to.
+ *
+ * Order matters on the way back in: a VM has to exist before the detail card
+ * that names it as parent, so parents are emitted ahead of their children.
+ */
+function indexWorkloads(elements) {
+    const vmToSubnet = {};
+    workloadsBySubnet = {};
+    totalVmCount = 0;
+
+    elements.forEach(function(el) {
+        const d = el.data;
+        if (d.type === 'vm' || d.type === 'nic') {
+            if (d.type === 'vm') {
+                vmToSubnet[d.id] = d.parent;
+                totalVmCount += 1;
+            }
+            (workloadsBySubnet[d.parent] = workloadsBySubnet[d.parent] || []).push(el);
+        }
+    });
+    elements.forEach(function(el) {
+        const d = el.data;
+        if (d.type === 'vm_detail') {
+            const subnetId = vmToSubnet[d.parent];
+            if (subnetId) workloadsBySubnet[subnetId].push(el);
+        }
+    });
+}
+
+/**
+ * The subnet a VM, NIC, or VM detail card belongs to.
+ */
+function owningSubnet(node) {
+    return node.data('type') === 'vm_detail'
+        ? node.parent().parent()
+        : node.parent();
+}
+
+/**
+ * A subnet collapses when it holds more NICs than the render limit — unless it
+ * has been expanded explicitly by drilling into it.
+ */
+function isSubnetCollapsed(subnet) {
+    if (!subnet || subnet.length === 0) return false;
+    if (expandedSubnets.has(subnet.id())) return false;
+    return (subnet.data('nic_count') || 0) > renderLimit;
+}
+
+/**
+ * Change how many NICs a subnet may hold before its contents collapse.
+ *
+ * Re-deciding every subnet drops any drill-down expansions, which is the point
+ * — the new limit should apply uniformly rather than leaving earlier clicks
+ * pinned open.
+ */
+function setRenderLimit(value) {
+    const parsed = parseInt(value, 10);
+    renderLimit = (isNaN(parsed) || parsed < 0) ? DEFAULT_RENDER_LIMIT : parsed;
+
+    if (!cy || cy.elements().length === 0) return;
+
+    if (drillDownActive) backToOverview();
+    expandedSubnets.clear();
+    applyVisibility();
+    layoutVisible();
+    cy.fit(cy.elements(':visible'), 50);
+    updateGraphInfo();
+    reportCollapsed();
+}
+
+/**
+ * Say how many subnets are holding their contents back.
+ */
+function reportCollapsed() {
+    const collapsed = cy.nodes('[type="subnet"][?collapsed]:visible');
+    const withWork = cy.nodes('[type="subnet"][?nic_count]:visible');
+
+    if (withWork.length === 0) {
+        showStatus('limitStatus', 'No VMs or NICs in view', 'info');
+        return;
+    }
+    if (collapsed.length === 0) {
+        showStatus('limitStatus',
+            `Drawing workloads in all ${withWork.length} populated subnet${withWork.length === 1 ? '' : 's'}`,
+            'success');
+        return;
+    }
+    const hiddenVms = collapsed.reduce(function(sum, s) {
+        return sum + (s.data('vm_count') || 0);
+    }, 0);
+    showStatus('limitStatus',
+        `${collapsed.length} subnet${collapsed.length === 1 ? '' : 's'} collapsed ` +
+        `(${hiddenVms} VMs) — click one to drill in`, 'info');
+}
+
+
+/**
  * Refresh the info panel with what is actually on screen.
  */
 function updateGraphInfo() {
@@ -593,238 +831,128 @@ function updateGraphInfo() {
         `${cy.nodes('[type="resource_group"]:visible').length} of ${allResourceGroups.length}`;
     document.getElementById('infoNodes').textContent = cy.nodes(':visible').length;
     document.getElementById('infoEdges').textContent = cy.edges(':visible').length;
+
+    // Collapsed subnets drop their cards from the graph, so the total has to
+    // come from the scan rather than from what's currently in it.
+    const vmsDrawn = cy.nodes('[type="vm"]:visible').length;
+    document.getElementById('infoVms').textContent = totalVmCount === vmsDrawn
+        ? String(totalVmCount)
+        : `${vmsDrawn} of ${totalVmCount} drawn`;
 }
 
+
 /**
- * Drill down into a subnet to show NICs and VMs
+ * Drill into a subnet: expand it if it was collapsed, dim everything else, and
+ * zoom to its contents.
+ *
+ * The VM and NIC cards already came down with the scan, so this is a
+ * visibility change rather than a fetch. The old path re-listed every NIC in
+ * the subscription and issued a GET per VM on each click.
  */
-async function drillDownToSubnet(subnetNode) {
+function drillDownToSubnet(subnetNode) {
     if (drillDownActive) return;
 
     const subnetData = subnetNode.data();
-    const azureId = subnetData.azure_id;
-    const subscriptionId = document.getElementById('infoSub').textContent;
-
-    if (!azureId || !subscriptionId) return;
+    if (!subnetData.nic_count) {
+        showStatus('detailStatus', 'No NICs or VMs in this subnet', 'info');
+        return;
+    }
 
     drillDownActive = true;
+    document.getElementById('detailSection').style.display = 'block';
 
-    // Show detail panel
-    const detailSection = document.getElementById('detailSection');
-    detailSection.style.display = 'block';
-    showStatus('detailStatus', 'Loading resources...', 'loading');
+    // Expand this subnet even if the render limit had collapsed it.
+    expandedSubnets.add(subnetNode.id());
+    applyVisibility();
+    layoutVisible();
 
-    // Update detail panel header
-    const detailPanel = document.getElementById('detailPanel');
-    detailPanel.innerHTML = `
-        <div class="detail-item">
-            <span class="detail-label">Subnet:</span> ${subnetData.label}
-        </div>
-    `;
+    // Dim everything that isn't this subnet, its contents, or its containers.
+    const keep = subnetNode
+        .union(subnetNode.ancestors())
+        .union(subnetNode.descendants());
+    cy.nodes().forEach(function(node) {
+        node.style('opacity', keep.contains(node) ? 1 : 0.15);
+    });
+    cy.edges().style('opacity', 0.1);
 
-    try {
-        const res = await fetch('/api/subnet/resources', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                subscription_id: subscriptionId,
-                subnet_azure_id: azureId,
-            })
-        });
+    subnetNode.style({ 'border-color': '#e8374a', 'border-width': 3 });
 
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Failed to fetch resources');
+    cy.animate({
+        fit: {
+            eles: subnetNode.union(subnetNode.descendants()),
+            padding: 80,
+        },
+        duration: 500,
+    });
 
-        // Remove any previously added drill-down nodes
-        cy.nodes('[type="nic"]').remove();
-        cy.nodes('[type="vm"]').remove();
-        cy.edges('[type="attached_to"]').remove();
-
-        const subnetPos = subnetNode.position();
-        const vmNodes = [];
-
-        // Build a map of VM name -> list of NICs
-        const vmNicMap = {};
-        data.nics.forEach(function(nic) {
-            if (nic.vm_name) {
-                if (!vmNicMap[nic.vm_name]) vmNicMap[nic.vm_name] = [];
-                vmNicMap[nic.vm_name].push(nic);
-            }
-        });
-
-        // Create VM compound nodes with a detail child inside
-        data.vms.forEach(function(vm) {
-            const vmId = 'vm_' + vm.name;
-            const nics = vmNicMap[vm.name] || [];
-            const ips = nics.map(function(n) {
-                return n.private_ip || '?';
-            }).join(', ');
-
-            // VM container node (shows name at top)
-            vmNodes.push({
-                data: {
-                    id: vmId,
-                    label: vm.name,
-                    type: 'vm',
-                    parent: subnetNode.id(),
-                    vm_size: vm.vm_size,
-                    os_type: vm.os_type,
-                }
-            });
-
-            // Detail child node (shows size + IP inside)
-            let detailLines = [];
-            if (vm.vm_size) detailLines.push(vm.vm_size);
-            if (vm.os_type) detailLines.push(String(vm.os_type));
-            if (ips) detailLines.push(ips);
-
-            vmNodes.push({
-                data: {
-                    id: vmId + '_detail',
-                    label: detailLines.join('\n'),
-                    type: 'vm_detail',
-                    parent: vmId,
-                }
-            });
-        });
-
-        // Orphan NICs (no VM attached)
-        data.nics.forEach(function(nic) {
-            if (!nic.vm_name) {
-                vmNodes.push({
-                    data: {
-                        id: 'nic_' + nic.name,
-                        label: nic.name + '\n' + (nic.private_ip || ''),
-                        type: 'nic',
-                        parent: subnetNode.id(),
-                    }
-                });
-            }
-        });
-
-        // Add to graph
-        cy.add(vmNodes);
-
-        // Hide all nodes except the ancestors and siblings of this subnet
-        const parentVnet = subnetNode.parent();
-        const ancestors = subnetNode.ancestors();
-        cy.nodes().forEach(function(node) {
-            const type = node.data('type');
-            // Keep: the drilled subnet, its ancestors, and new VM/detail nodes
-            if (node.same(subnetNode) || ancestors.contains(node) ||
-                type === 'vm' || type === 'vm_detail' || type === 'nic') {
-                return;
-            }
-            // Keep siblings of the subnet (other subnets in same VNet)
-            if (node.parent() && node.parent().same(parentVnet) && type === 'subnet') {
-                node.style('opacity', 0.2);
-                return;
-            }
-            // Hide everything else
-            node.style('opacity', 0.15);
-        });
-        // Dim peering edges
-        cy.edges().style('opacity', 0.1);
-
-        // Highlight the active subnet
-        subnetNode.style('border-color', '#e8374a');
-        subnetNode.style('border-width', 3);
-
-        // Position VM nodes in a row
-        const vmOnlyNodes = cy.nodes('[type="vm"]');
-        const spacing = 220;
-        const count = vmOnlyNodes.length;
-        const totalW = (count - 1) * spacing;
-        vmOnlyNodes.forEach(function(node, i) {
-            node.position({
-                x: subnetPos.x - totalW / 2 + i * spacing,
-                y: subnetPos.y,
-            });
-        });
-
-        // Position orphan NICs after VMs
-        const orphanNics = cy.nodes('[type="nic"]');
-        orphanNics.forEach(function(node, i) {
-            node.position({
-                x: subnetPos.x - totalW / 2 + (count + i) * spacing,
-                y: subnetPos.y,
-            });
-        });
-
-        // Zoom to the subnet and its contents
-        const allDrillContent = subnetNode.union(subnetNode.descendants());
-        cy.animate({
-            fit: { eles: allDrillContent, padding: 80 },
-            duration: 500,
-        });
-
-        // Update detail panel
-        let detailHtml = `
-            <div class="detail-item">
-                <span class="detail-label">Subnet:</span> ${subnetData.label}
-            </div>
-        `;
-
-        if (data.nics.length > 0) {
-            detailHtml += `<div class="detail-item"><span class="detail-label">NICs (${data.nics.length}):</span></div>`;
-            data.nics.forEach(function(nic) {
-                detailHtml += `<div class="detail-item">&nbsp;&nbsp;${nic.name} - ${nic.private_ip || 'no IP'}`;
-                if (nic.vm_name) detailHtml += ` &rarr; ${nic.vm_name}`;
-                detailHtml += '</div>';
-            });
-        } else {
-            detailHtml += '<div class="detail-item">No NICs found</div>';
-        }
-
-        if (data.vms.length > 0) {
-            detailHtml += `<div class="detail-item"><span class="detail-label">VMs (${data.vms.length}):</span></div>`;
-            data.vms.forEach(function(vm) {
-                detailHtml += `<div class="detail-item">&nbsp;&nbsp;${vm.name}`;
-                if (vm.vm_size) detailHtml += ` (${vm.vm_size})`;
-                if (vm.os_type) detailHtml += ` - ${vm.os_type}`;
-                detailHtml += '</div>';
-            });
-        }
-
-        detailPanel.innerHTML = detailHtml;
-        showStatus('detailStatus',
-            `${data.nics.length} NICs, ${data.vms.length} VMs`, 'success');
-
-    } catch (e) {
-        showStatus('detailStatus', `Error: ${e.message}`, 'error');
-        drillDownActive = false;
-    }
+    renderSubnetDetail(subnetNode);
 }
 
 /**
- * Return to the full topology overview
+ * Fill the sidebar with what the drilled subnet holds, read from the graph.
+ */
+function renderSubnetDetail(subnetNode) {
+    const vms = subnetNode.children('[type="vm"]');
+    const nics = subnetNode.children('[type="nic"]');
+    const data = subnetNode.data();
+
+    let html = `
+        <div class="detail-item">
+            <span class="detail-label">Subnet:</span> ${data.label.replace('\n', ' ')}
+        </div>
+    `;
+
+    if (vms.length > 0) {
+        html += `<div class="detail-item"><span class="detail-label">VMs (${vms.length}):</span></div>`;
+        vms.forEach(function(vm) {
+            const d = vm.data();
+            let line = `&nbsp;&nbsp;${d.label}`;
+            if (d.vm_size) line += ` (${d.vm_size})`;
+            if (d.os_type) line += ` - ${d.os_type}`;
+            if (d.private_ips) line += ` - ${d.private_ips}`;
+            html += `<div class="detail-item">${line}</div>`;
+        });
+    }
+
+    if (nics.length > 0) {
+        html += `<div class="detail-item"><span class="detail-label">Unattached NICs (${nics.length}):</span></div>`;
+        nics.forEach(function(nic) {
+            const d = nic.data();
+            html += `<div class="detail-item">&nbsp;&nbsp;${d.label.replace('\n', ' - ')}</div>`;
+        });
+    }
+
+    document.getElementById('detailPanel').innerHTML = html;
+    showStatus('detailStatus',
+        `${data.vm_count || 0} VMs, ${data.nic_count || 0} NICs`, 'success');
+}
+
+
+/**
+ * Return to the full topology overview.
  */
 function backToOverview() {
-    // Remove drill-down nodes
-    cy.nodes('[type="vm_detail"]').remove();
-    cy.nodes('[type="vm"]').remove();
-    cy.nodes('[type="nic"]').remove();
+    drillDownActive = false;
 
-    // Restore opacity on all remaining nodes and edges
+    // Drop any drill-down expansion so the render limit governs again.
+    expandedSubnets.clear();
+    applyVisibility();
+    layoutVisible();
+
+    // Restore opacity on everything the drill-down dimmed.
     cy.nodes().style('opacity', 1);
     cy.edges().style('opacity', 1);
 
-    // Reset any highlighted subnet borders
-    cy.nodes('[type="subnet"]').style({
-        'border-color': '#0078d4',
-        'border-width': 1,
-    });
+    // Reset the highlighted subnet border; the stylesheet re-applies the
+    // workload marking on its own.
+    cy.nodes('[type="subnet"]').removeStyle('border-color border-width');
 
-    // Hide detail panel
     document.getElementById('detailSection').style.display = 'none';
 
-    // Zoom back to full view — filtered-out resource groups stay hidden.
     cy.animate({
         fit: { eles: cy.elements(':visible'), padding: 50 },
         duration: 500,
     });
-
-    drillDownActive = false;
 }
 
 /**
@@ -838,6 +966,7 @@ async function clearGraph() {
         }
         allResourceGroups = [];
         selectedResourceGroups = new Set();
+        expandedSubnets = new Set();
         document.getElementById('rgFilterSection').style.display = 'none';
         document.getElementById('rgStatus').style.display = 'none';
         document.getElementById('graphInfo').style.display = 'none';

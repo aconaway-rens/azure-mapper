@@ -165,9 +165,25 @@
             margin-right: 8px;
         }
 
+        .field-label {
+            display: block;
+            font-size: 12px;
+            color: #555;
+            margin-bottom: 4px;
+        }
+
+        .field-hint {
+            font-size: 11px;
+            color: #888;
+            line-height: 1.4;
+            margin-bottom: 8px;
+        }
+
         .rg { background: #f0f0f0; border: 2px dashed #a0a0a0; }
         .vnet { background: #e6f2ff; border: 2px dashed #0078d4; }
         .subnet { background: #50e6ff; }
+        .subnet-workload { background: #50e6ff; border: 2px solid #8661c5; }
+        .subnet-collapsed { background: #b9a3e0; border: 2px dashed #8661c5; }
         .peering { background: #107c10; }
         .nic-color { background: #ff8c00; }
         .vm-color { background: #8661c5; }
@@ -291,6 +307,20 @@
                 <div id="rgStatus" class="status" style="display:none;"></div>
             </div>
 
+            <div class="section" id="limitSection" style="display:none;">
+                <h3>Workload Detail</h3>
+                <label class="field-label" for="renderLimit">
+                    Draw VMs in subnets with at most
+                </label>
+                <input type="number" id="renderLimit" min="0" max="500" value="10"
+                       onchange="setRenderLimit(this.value)">
+                <div class="field-hint">
+                    NICs. Busier subnets collapse to a summary you can click
+                    into — set 0 to collapse them all.
+                </div>
+                <div id="limitStatus" class="status" style="display:none;"></div>
+            </div>
+
             <div class="section" id="detailSection" style="display:none;">
                 <h3>Subnet Detail</h3>
                 <button class="back-btn" onclick="backToOverview()">Back to Overview</button>
@@ -303,6 +333,7 @@
                 <div id="graphInfo" class="info-panel" style="display:none;">
                     <strong>Subscription:</strong><br><span id="infoSub"></span><br><br>
                     <strong>Resource Groups:</strong><br><span id="infoRgs">0</span><br><br>
+                    <strong>VMs:</strong><br><span id="infoVms">0</span><br><br>
                     <strong>Nodes:</strong><br><span id="infoNodes">0</span><br><br>
                     <strong>Edges:</strong><br><span id="infoEdges">0</span>
                 </div>
@@ -322,6 +353,14 @@
                     <div class="legend-item">
                         <div class="legend-color subnet"></div>
                         <span>Subnet</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color subnet-workload"></div>
+                        <span>Subnet with VMs</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color subnet-collapsed"></div>
+                        <span>Collapsed (click to expand)</span>
                     </div>
                     <div class="legend-item">
                         <div class="legend-color peering"></div>

@@ -236,10 +236,80 @@ class AzureResourceIngestor:
         )
         return {"nics": nics, "vms": vms}
 
+    def get_nics_and_vms(self, subscription_id: str) -> Dict[str, Any]:
+        """Fetch every NIC in the subscription, resolved to its VM and subnet.
+
+        This is the subscription-wide counterpart to ``get_subnet_resources``.
+        Two paginated list calls cover the whole subscription, which is far
+        cheaper than the per-subnet path: that one re-lists every NIC in the
+        subscription on each drill-down and then issues a separate GET per VM.
+
+        NICs are keyed by the subnet they attach to (lowercased, since ARM IDs
+        vary in case), so the graph builder can hang them off the right subnet.
+        """
+        network_client = NetworkManagementClient(
+            self.credential, subscription_id
+        )
+        compute_client = ComputeManagementClient(
+            self.credential, subscription_id
+        )
+
+        # One pass over the VMs, so NIC -> VM resolution is a dict lookup
+        # rather than a GET each.
+        vms: Dict[str, Dict[str, Any]] = {}
+        for vm in compute_client.virtual_machines.list_all():
+            vms[vm.id.lower()] = {
+                "id": vm.id,
+                "name": vm.name,
+                "resource_group": vm.id.split("/")[4],
+                "vm_size": (
+                    vm.hardware_profile.vm_size if vm.hardware_profile else ""
+                ),
+                "os_type": str(
+                    vm.storage_profile.os_disk.os_type
+                    if vm.storage_profile and vm.storage_profile.os_disk
+                    and vm.storage_profile.os_disk.os_type
+                    else ""
+                ),
+            }
+
+        nics: List[Dict[str, Any]] = []
+        for nic in network_client.network_interfaces.list_all():
+            if not nic.ip_configurations:
+                continue
+
+            vm_id = (
+                nic.virtual_machine.id if nic.virtual_machine else None
+            )
+            vm = vms.get(vm_id.lower()) if vm_id else None
+
+            # A NIC can hold several ipconfigs, each potentially on its own
+            # subnet. Emit one record per subnet-bearing ipconfig so the NIC
+            # shows up under every subnet it actually touches.
+            for ip_config in nic.ip_configurations:
+                if not ip_config.subnet or not ip_config.subnet.id:
+                    continue
+                nics.append({
+                    "id": nic.id,
+                    "name": nic.name,
+                    "subnet_id": ip_config.subnet.id.lower(),
+                    "private_ip": ip_config.private_ip_address,
+                    "vm_id": vm_id,
+                    "vm_name": vm["name"] if vm else None,
+                })
+
+        logger.info(
+            f"Found {len(nics)} NIC attachments across {len(vms)} VMs"
+        )
+        return {"nics": nics, "vms": vms}
+
     def scan_subscription(self, subscription_id: str) -> Dict[str, Any]:
-        """Perform a full scan of a subscription: VNets, subnets, and peerings."""
+        """Perform a full scan: VNets, subnets, peerings, NICs, and VMs."""
+        compute = self.get_nics_and_vms(subscription_id)
         return {
             "subscription_id": subscription_id,
             "vnets": self.get_vnets_and_subnets(subscription_id),
             "peerings": self.get_vnet_peerings(subscription_id),
+            "nics": compute["nics"],
+            "vms": compute["vms"],
         }

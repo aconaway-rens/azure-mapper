@@ -18,7 +18,16 @@ else; no topology data leaves the host it runs on.
   - VNets nested inside with address space labels
   - Subnets nested inside VNets with CIDR labels
   - Peering connections shown as dashed green edges (one-way peerings flagged in red)
-- **Subnet drill-down** — click a subnet to load its NICs and VMs
+- **VMs and NICs in the diagram** — workloads are drawn inside their subnets,
+  with size, OS, and private IPs on each card. Unattached NICs are drawn on
+  their own, since an orphaned NIC is usually worth noticing.
+- **Per-subnet render limit** — a subnet holding more NICs than the limit
+  (default 10) collapses to a marked summary instead of flooding the diagram,
+  so a subscription with fifty VMs behind one subnet still reads. Subnets
+  holding workloads are outlined in purple whether or not their cards are
+  drawn, and collapsed ones say what they're hiding.
+- **Subnet drill-down** — click a subnet to expand it and dim everything else.
+  Its contents come from the scan already in memory, so there's no round trip.
 - **Resource group filter** — tick one or more resource groups to narrow the
   diagram; the canvas re-packs around what's left, and the sidebar reports any
   peerings that now run off to a hidden resource group. Filtering is local to

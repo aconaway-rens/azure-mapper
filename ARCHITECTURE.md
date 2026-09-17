@@ -15,10 +15,11 @@
 │  │  │  │        Cytoscape.js v3.28  (vendored, local)       │  │   │  │
 │  │  │  │                                                    │  │   │  │
 │  │  │  │  Compound nodes:                                   │  │   │  │
-│  │  │  │   RG → VNet → Subnet                               │  │   │  │
+│  │  │  │   RG → VNet → Subnet → VM → detail                 │  │   │  │
 │  │  │  │  Peering edges (VNet↔VNet)                         │  │   │  │
 │  │  │  │  Drill-down: Subnet → VM cards                     │  │   │  │
 │  │  │  │  Resource-group filter (display-only, client-side) │  │   │  │
+│  │  │  │  Per-subnet render limit; busy subnets collapse    │  │   │  │
 │  │  │  │  Custom manual layout engine                       │  │   │  │
 │  │  │  └────────────────────────────────────────────────────┘  │   │  │
 │  │  └──────────────────────────────────────────────────────────┘   │  │
