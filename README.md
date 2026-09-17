@@ -32,6 +32,7 @@ else; no topology data leaves the host it runs on.
   drawn, and collapsed ones say what they're hiding.
 - **Subnet drill-down** — click a subnet to expand it and dim everything else.
   Its contents come from the scan already in memory, so there's no round trip.
+  Leave with Escape, a click on empty canvas, or the sidebar button.
 - **Resource group filter** — tick one or more resource groups to narrow the
   diagram; the canvas re-packs around what's left, and the sidebar reports any
   peerings that now run off to a hidden resource group. Filtering is local to

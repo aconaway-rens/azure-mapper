@@ -285,9 +285,8 @@
             <div class="section">
                 <h3>Subscription</h3>
                 <select id="subscriptionSelect">
-                    <option value="">-- Load subscriptions --</option>
+                    <option value="">-- Loading… --</option>
                 </select>
-                <button onclick="loadSubscriptions()">Load Subscriptions</button>
                 <div id="subStatus" class="status" style="display:none;"></div>
             </div>
 
@@ -325,7 +324,7 @@
 
             <div class="section" id="detailSection" style="display:none;">
                 <h3>Subnet Detail</h3>
-                <button class="back-btn" onclick="backToOverview()">Back to Overview</button>
+                <button class="back-btn" onclick="backToOverview()">&larr; Back to Overview (Esc)</button>
                 <div id="detailPanel" class="detail-panel"></div>
                 <div id="detailStatus" class="status" style="display:none;"></div>
             </div>

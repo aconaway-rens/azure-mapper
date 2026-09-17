@@ -34,6 +34,9 @@ let selectedResourceGroups = new Set();
  * Authentication happens server-side via DefaultAzureCredential, so there is
  * nothing to sign into here — this just reports what the host is running as,
  * and surfaces the credential error if it resolved nothing.
+ *
+ * Returns whether a credential resolved, so page load knows if it's worth
+ * asking for the subscription list.
  */
 async function checkIdentity() {
     showStatus('authStatus', 'Checking Azure credential…', 'loading');
@@ -51,8 +54,10 @@ async function checkIdentity() {
             tenant.textContent = `Tenant ${data.tenant_id}`;
             tenant.style.display = 'block';
         }
+        return true;
     } catch (e) {
         showStatus('authStatus', `No Azure credential: ${e.message}`, 'error');
+        return false;
     }
 }
 
@@ -71,6 +76,12 @@ function initializeCytoscape() {
     // Click a subnet to drill down into its resources
     cy.on('tap', 'node[type="subnet"]', function(evt) {
         drillDownToSubnet(evt.target);
+    });
+
+    // Click the empty canvas to come back out. The sidebar button is easy to
+    // miss when the view has zoomed into one subnet and your eyes are on it.
+    cy.on('tap', function(evt) {
+        if (evt.target === cy && drillDownActive) backToOverview();
     });
 }
 
@@ -357,6 +368,8 @@ function showStatus(elementId, message, type = 'info') {
  * Load available subscriptions
  */
 async function loadSubscriptions() {
+    const select = document.getElementById('subscriptionSelect');
+    select.innerHTML = '<option value="">-- Loading… --</option>';
     showStatus('subStatus', 'Loading subscriptions...', 'loading');
     try {
         const res = await fetch('/api/subscriptions');
@@ -366,7 +379,6 @@ async function loadSubscriptions() {
             throw new Error(data.error || 'Failed to load subscriptions');
         }
 
-        const select = document.getElementById('subscriptionSelect');
         select.innerHTML = '<option value="">-- Select subscription --</option>';
 
         data.subscriptions.forEach(sub => {
@@ -378,7 +390,8 @@ async function loadSubscriptions() {
 
         showStatus('subStatus', `Loaded ${data.subscriptions.length} subscriptions`, 'success');
     } catch (e) {
-        showStatus('subStatus', `Error: ${e.message}`, 'error');
+        select.innerHTML = '<option value="">-- Unavailable --</option>';
+        showStatus('subStatus', `Error: ${e.message} — fix the credential and reload`, 'error');
     }
 }
 
@@ -921,7 +934,12 @@ function drillDownToSubnet(subnetNode) {
     }
 
     drillDownActive = true;
-    document.getElementById('detailSection').style.display = 'block';
+    const detailSection = document.getElementById('detailSection');
+    detailSection.style.display = 'block';
+    // Bring the way out into view rather than leaving it below the fold.
+    if (detailSection.scrollIntoView) {
+        detailSection.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
 
     // Expand this subnet even if the render limit had collapsed it.
     expandedSubnets.add(subnetNode.id());
@@ -1062,6 +1080,14 @@ async function clearGraph() {
 /**
  * Initialize on page load
  */
-document.addEventListener('DOMContentLoaded', () => {
-    checkIdentity();
+document.addEventListener('DOMContentLoaded', async function() {
+    // Escape is the quickest way out of a drill-down, wherever the pointer is.
+    document.addEventListener('keydown', function(evt) {
+        if (evt.key === 'Escape' && drillDownActive) backToOverview();
+    });
+
+    // The subscription list needs no input from anyone — fetch it as soon as
+    // the host credential is known to be good. Asking before that just trades
+    // a useful credential error for a confusing 500.
+    if (await checkIdentity()) loadSubscriptions();
 });
