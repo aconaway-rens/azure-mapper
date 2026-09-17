@@ -30,6 +30,43 @@ else; no topology data leaves the host it runs on.
 
 - Docker and Docker Compose (or Python 3.12+ to run it directly)
 - An identity with **Reader** on the subscriptions you want to map
+- On **Windows for ARM**, an x64 build of Python — see below
+
+### Architecture notes
+
+x86-64 and ARM are both fine on Linux and macOS, and Docker sidesteps the
+question entirely: the image is Linux, and every dependency ships Linux wheels
+for x86-64 and aarch64 alike.
+
+**Windows on ARM is the exception.** `cryptography` — pulled in by
+`azure-identity` — publishes no `win_arm64` wheels at all, only `win_amd64`. An
+ARM64 Python therefore falls back to compiling it from Rust source and fails
+unless you have both Rust and the MSVC C++ build tools installed:
+
+```
+error: linker `link.exe` not found
+ERROR: Failed building wheel for cryptography
+```
+
+Use the **x64** Python build instead. It runs under emulation and gets the
+prebuilt wheel, which is faster to set up and roughly as fast to run for a tool
+that spends its time waiting on Azure:
+
+```powershell
+winget install Python.Python.3.13 --architecture x64
+```
+
+On python.org that's the "Windows installer (64-bit)" download — the
+`-amd64.exe` file, not `-arm64.exe`. Build the venv with that interpreter, then
+confirm which one you actually got before installing anything:
+
+```powershell
+python -c "import sysconfig; print(sysconfig.get_platform())"
+```
+
+`win-amd64` is what you want. If it prints `win-arm64`, the venv came from the
+ARM interpreter and `pip install` will fail on cryptography — use `py --list-paths`
+to find the x64 install and recreate the venv from it.
 
 ## Get it
 
@@ -88,6 +125,9 @@ python app/app.py
 ```
 
 Open http://127.0.0.1:8080. Override the bind with `HOST` / `PORT` if 8080 is taken.
+
+On Windows for ARM, make sure that venv is built from an x64 Python — see
+[Architecture notes](#architecture-notes).
 
 To run that same session under Docker instead, build with the Azure CLI included
 and mount the host's login (uncomment the `volumes` block in `docker-compose.yml`):
