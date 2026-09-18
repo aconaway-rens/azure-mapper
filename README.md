@@ -21,10 +21,11 @@ else; no topology data leaves the host it runs on.
 - **VMs and NICs in the diagram** — workloads are drawn inside their subnets,
   with size, OS, and private IPs on each card. Unattached NICs are drawn on
   their own, since an orphaned NIC is usually worth noticing.
-- **NSG attachment** — subnets and NICs name the network security group
-  attached to them, in the caption and the drill-down panel. A subnet with none
-  says so when you drill in, which is the coverage question worth asking. Rules
-  themselves aren't read — this is attachment only.
+- **NSG attachment** — a NIC or VM card guarded by a network security group
+  wears a dark badge naming it, tagged onto the bottom of the card. Subnet-level
+  groups are named in the subnet caption, and a subnet with none says so when
+  you drill in, which is the coverage question worth asking. Rules themselves
+  aren't read — this is attachment only.
 - **Public IPs on the diagram** — a NIC with a public IP shows it under its
   private one, a VM card shows the public IPs of the NICs folded into it, and a
   public load balancer shows its frontend address. Anything holding a public IP

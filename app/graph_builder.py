@@ -58,8 +58,6 @@ def _nic_label(nic: Dict[str, Any]) -> str:
     lines = [nic["name"], nic.get("private_ip") or "no IP"]
     if nic.get("public_ip"):
         lines.append(f"public {nic['public_ip']}")
-    if nic.get("nsg_name"):
-        lines.append(f"NSG {nic['nsg_name']}")
     return "\n".join(lines)
 
 
@@ -277,12 +275,20 @@ class TopologyGraph:
                 entry["nics"].append(nic_node_id)
                 nic_nodes[nic["id"].lower()] = nic_node_id
                 node_vnets[nic_node_id] = vnet_node_id
+                if nic.get("nsg_name"):
+                    self._add_nsg_badge(
+                        nic_node_id, subnet_node_id, nic["nsg_name"]
+                    )
             elif vm_id:
                 vm_nics.setdefault(vm_id, []).append(nic)
             else:
                 orphan_node_id = f"nic_{subnet_node_id}_{nic['name']}"
                 nic_nodes[nic["id"].lower()] = orphan_node_id
                 node_vnets[orphan_node_id] = vnet_node_id
+                if nic.get("nsg_name"):
+                    self._add_nsg_badge(
+                        orphan_node_id, subnet_node_id, nic["nsg_name"]
+                    )
                 self.add_node(
                     orphan_node_id,
                     "nic",
@@ -333,7 +339,6 @@ class TopologyGraph:
             detail = [p for p in (
                 vm.get("vm_size"), vm.get("os_type"), ips,
                 f"public {public}" if public else "",
-                f"NSG {nsg_names}" if nsg_names else "",
             ) if p]
             self.add_node(
                 f"{vm_node_id}_detail", "vm_detail",
@@ -342,12 +347,32 @@ class TopologyGraph:
                 data={},
             )
 
+            if nsg_names:
+                self._add_nsg_badge(vm_node_id, subnet_node_id, nsg_names)
+
             # A NIC folded into a VM card has no node of its own, so anything
             # pointing at that NIC — a load balancer's backend pool — must
             # point at the card instead.
             node_vnets[vm_node_id] = vnet_node_id
             for nic in nics:
                 nic_nodes[nic["id"].lower()] = vm_node_id
+
+    def _add_nsg_badge(
+        self, card_node_id: str, parent_node_id: str, nsg_name: str
+    ) -> None:
+        """Tag a NIC or VM card with the NSG guarding it.
+
+        A badge rather than another line of caption text: on a card already
+        carrying a name, an IP and sometimes a public IP, one more line is easy
+        to read straight past. It is a sibling of the card, not a child —
+        Cytoscape sizes a compound from its children, so nesting it would
+        reshape the card it is meant to annotate.
+        """
+        self.add_node(
+            f"nsg_{card_node_id}", "nsg", nsg_name,
+            parent=parent_node_id,
+            data={"nsg_name": nsg_name, "for_node": card_node_id},
+        )
 
     def _add_spanning_vms(
         self,

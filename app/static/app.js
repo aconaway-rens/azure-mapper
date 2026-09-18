@@ -11,7 +11,7 @@ let drillDownActive = false;
 // flat, so past this point the subnet collapses to a marked summary you click
 // into. The cards stay in the graph either way.
 const DEFAULT_RENDER_LIMIT = 10;
-const WORKLOAD_TYPES = ['vm', 'vm_detail', 'nic', 'lb'];
+const WORKLOAD_TYPES = ['vm', 'vm_detail', 'nic', 'lb', 'nsg'];
 
 let renderLimit = DEFAULT_RENDER_LIMIT;
 // Subnets expanded by an explicit drill-down, overriding the limit.
@@ -354,6 +354,26 @@ function topologyStyles() {
                     'text-halign': 'center',
                 }
             },
+            // NSG badge, tagged onto the card it guards
+            {
+                selector: 'node[type="nsg"]',
+                style: {
+                    'shape': 'roundrectangle',
+                    'background-color': '#374151',
+                    'border-color': '#1f2937',
+                    'border-width': 1,
+                    'width': 128,
+                    'height': 22,
+                    'font-size': 8,
+                    'font-weight': 'bold',
+                    'color': '#fff',
+                    'text-valign': 'center',
+                    'text-halign': 'center',
+                    'text-wrap': 'none',
+                    'text-max-width': '120px',
+                    'z-index': 20,
+                }
+            },
             // Internet-facing: a NIC, VM card or load balancer holding a
             // public IP. Worth spotting without reading every caption.
             //
@@ -689,7 +709,8 @@ function layoutTopology(rgNodes) {
         // An internal load balancer fronts what's in the subnet, so it reads
         // best sitting above them — inside the subnet, unlike a public one.
         const lbs = cards.filter('[type="lb"]');
-        const rest = cards.difference(lbs);
+        const badges = cards.filter('[type="nsg"]');
+        const rest = cards.difference(lbs).difference(badges);
 
         const cols = Math.max(1, Math.ceil(Math.sqrt(rest.length)));
         const gridWidth = rest.length > 0
@@ -714,6 +735,17 @@ function layoutTopology(rgNodes) {
                 cursorY + Math.floor(i / cols) * (CARD_H + CARD_GAP) + CARD_H / 2
             );
         });
+        // Badges are placed against their card rather than in the grid, so
+        // this has to come after everything else has landed.
+        badges.forEach(function(badge) {
+            const target = cy.getElementById(badge.data('for_node'));
+            if (target.length === 0) return;
+            const box = target.boundingBox({ includeLabels: false });
+            // Straddling the bottom edge reads as attached to the card,
+            // without covering the name and addresses written inside it.
+            badge.position({ x: (box.x1 + box.x2) / 2, y: box.y2 - 3 });
+        });
+
         return alignAndMeasure(subnet, x, y);
     }
 
@@ -1230,7 +1262,12 @@ function renderSubnetDetail(subnetNode) {
     if (orphans.length > 0) {
         html += `<div class="detail-item"><span class="detail-label">Unattached NICs (${orphans.length}):</span></div>`;
         orphans.forEach(function(nic) {
-            html += `<div class="detail-item">&nbsp;&nbsp;${nic.data('label').replace('\n', ' - ')}</div>`;
+            const d = nic.data();
+            // The card shows its NSG as a badge rather than in the caption, so
+            // the sidebar has to add it back from the data.
+            let line = `&nbsp;&nbsp;${d.label.split('\n').join(' - ')}`;
+            if (d.nsg_name) line += ` - NSG ${d.nsg_name}`;
+            html += `<div class="detail-item">${line}</div>`;
         });
     }
 
