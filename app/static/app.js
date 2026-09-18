@@ -530,6 +530,7 @@ function layoutTopology(rgNodes) {
     const VNET_GAP = 45, VNET_PAD = 32;
     const SUBNET_GAP = 30, SUBNET_PAD = 24, SUBNET_TITLE_H = 38;
     const CARD_W = 185, CARD_H = 80, CARD_GAP = 16, SPANNING_VM_GAP = 60;
+    const LB_H = 54, LB_ROW_GAP = 34;
 
     const cols = Math.max(Math.ceil(Math.sqrt(rgNodes.length)), 1);
     let cursorY = 0, idx = 0;
@@ -545,11 +546,35 @@ function layoutTopology(rgNodes) {
     }
 
     function layoutResourceGroup(rg, x, y) {
+        // A public load balancer belongs to no subnet and to no VNet — its
+        // backend pool reaches into one, but the balancer itself sits outside.
+        // Draw those above the VNet boxes, inside the resource group.
+        const publicLbs = rg.children('[type="lb"]');
+        const lbBand = publicLbs.length > 0 ? LB_H + LB_ROW_GAP : 0;
+
         let vnetX = x + RG_PAD;
         rg.children('[type="vnet"]').forEach(function(vnet) {
-            vnetX += layoutVnet(vnet, vnetX, y + RG_PAD).w + VNET_GAP;
+            vnetX += layoutVnet(vnet, vnetX, y + RG_PAD + lbBand).w + VNET_GAP;
         });
+
+        if (publicLbs.length > 0) {
+            const vnetRowWidth = Math.max(vnetX - VNET_GAP - (x + RG_PAD), 0);
+            placeRow(publicLbs, x + RG_PAD, vnetRowWidth, y + RG_PAD, LB_H);
+        }
         return alignAndMeasure(rg, x, y);
+    }
+
+    /**
+     * Lay cards out in a row, centred over a band of the given width.
+     */
+    function placeRow(cards, left, bandWidth, top, cardHeight) {
+        const rowWidth = cards.length * CARD_W + (cards.length - 1) * CARD_GAP;
+        let cursor = left + (bandWidth - rowWidth) / 2;
+        cards.forEach(function(card) {
+            placeCard(card, cursor + CARD_W / 2, top + cardHeight / 2);
+            cursor += CARD_W + CARD_GAP;
+        });
+        return rowWidth;
     }
 
     function layoutVnet(vnet, x, y) {
@@ -574,6 +599,40 @@ function layoutTopology(rgNodes) {
         const tallest = captions.reduce(function(m, h) { return Math.max(m, h); }, 0);
         placed.forEach(function(subnet, i) {
             shiftBy(subnet, 0, tallest - captions[i]);
+        });
+
+        // Give the row a single band, and make every subnet occupy it.
+        //
+        // An empty or collapsed subnet is a plain node, so its size is ours to
+        // set — left alone it renders as a small box tucked into the corner of
+        // its slot, reading as a different kind of thing rather than a subnet
+        // that happens to hold nothing. Those are stretched to the band. A
+        // populated subnet is a compound, sized by Cytoscape from its cards
+        // and not resizable, so it is centred in the band instead of hanging
+        // from the top of it.
+        const boxOf = function(sn) {
+            return sn.boundingBox({ includeLabels: false });
+        };
+        const boxTop = placed.length > 0
+            ? Math.min.apply(null, placed.map(function(sn) { return boxOf(sn).y1; }))
+            : rowTop;
+        const bandHeight = placed.reduce(function(tallest, sn) {
+            return Math.max(tallest, boxOf(sn).h);
+        }, 0);
+        const bandMiddle = boxTop + bandHeight / 2;
+
+        placed.forEach(function(subnet) {
+            if (subnet.isChildless()) {
+                // Borders count towards the rendered box, so set the height,
+                // measure what came out, and correct by the difference.
+                subnet.style('height', bandHeight);
+                const overshoot = boxOf(subnet).h - bandHeight;
+                if (Math.abs(overshoot) > 0.5) {
+                    subnet.style('height', bandHeight - overshoot);
+                }
+            }
+            const box = boxOf(subnet);
+            shiftBy(subnet, 0, bandMiddle - (box.y1 + box.h / 2));
         });
 
         let subnetBottom = rowTop;
@@ -610,12 +669,32 @@ function layoutTopology(rgNodes) {
         // rather than assume.
         if (cards.length === 0) return alignAndMeasure(subnet, x, y);
 
-        const cols = Math.max(1, Math.ceil(Math.sqrt(cards.length)));
-        cards.forEach(function(card, i) {
+        // An internal load balancer fronts what's in the subnet, so it reads
+        // best sitting above them — inside the subnet, unlike a public one.
+        const lbs = cards.filter('[type="lb"]');
+        const rest = cards.difference(lbs);
+
+        const cols = Math.max(1, Math.ceil(Math.sqrt(rest.length)));
+        const gridWidth = rest.length > 0
+            ? cols * CARD_W + (cols - 1) * CARD_GAP
+            : 0;
+        const lbRowWidth = lbs.length > 0
+            ? lbs.length * CARD_W + (lbs.length - 1) * CARD_GAP
+            : 0;
+        const bandWidth = Math.max(gridWidth, lbRowWidth);
+
+        let cursorY = y + SUBNET_TITLE_H;
+        if (lbs.length > 0) {
+            placeRow(lbs, x + SUBNET_PAD, bandWidth, cursorY, LB_H);
+            cursorY += LB_H + LB_ROW_GAP;
+        }
+
+        const gridLeft = x + SUBNET_PAD + (bandWidth - gridWidth) / 2;
+        rest.forEach(function(card, i) {
             placeCard(
                 card,
-                x + SUBNET_PAD + (i % cols) * (CARD_W + CARD_GAP) + CARD_W / 2,
-                y + SUBNET_TITLE_H + Math.floor(i / cols) * (CARD_H + CARD_GAP) + CARD_H / 2
+                gridLeft + (i % cols) * (CARD_W + CARD_GAP) + CARD_W / 2,
+                cursorY + Math.floor(i / cols) * (CARD_H + CARD_GAP) + CARD_H / 2
             );
         });
         return alignAndMeasure(subnet, x, y);

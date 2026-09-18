@@ -115,6 +115,7 @@ class TopologyGraph:
         subnet_nodes: Dict[str, str] = {}
         nic_nodes: Dict[str, str] = {}
         node_vnets: Dict[str, str] = {}
+        vnet_rgs: Dict[str, str] = {}
 
         # Track resource groups so we create each one only once
         resource_groups = set()
@@ -134,6 +135,7 @@ class TopologyGraph:
 
             # Create VNet as child of resource group
             vnet_id = f"vnet_{vnet_name}"
+            vnet_rgs[vnet_id] = rg_id
             prefixes = vnet_info["address_prefixes"]
             vnet_label = (
                 f"{vnet_name}\n{', '.join(prefixes)}" if prefixes
@@ -192,7 +194,7 @@ class TopologyGraph:
         self._add_spanning_vms(spanning_attachments, vms_by_id)
         self._add_load_balancers(
             scan_data.get("load_balancers", []),
-            subnet_nodes, nic_nodes, node_vnets,
+            subnet_nodes, nic_nodes, node_vnets, vnet_rgs,
         )
 
         # Create peering edges
@@ -359,14 +361,16 @@ class TopologyGraph:
         subnet_nodes: Dict[str, str],
         nic_nodes: Dict[str, str],
         node_vnets: Dict[str, str],
+        vnet_rgs: Dict[str, str],
     ) -> None:
         """Add a node per load balancer, wired to what it balances.
 
         An internal LB has a frontend in a subnet and is drawn inside it. A
-        public one has no subnet at all, so it hangs off the VNet its backend
-        members live in — the same place a subnet-spanning VM goes. An LB whose
-        members are absent from this scan has nowhere to sit and is skipped
-        rather than left unparented, which would drop it out of the layout.
+        public one is not part of any subnet — nor of the VNet, whatever its
+        backend pool reaches into — so it is parented to the resource group and
+        drawn above the VNet, outside its border. An LB whose members are
+        absent from this scan has nowhere to sit and is skipped rather than
+        left unparented, which would drop it out of the layout.
         """
         for lb in balancers:
             targets: List[str] = []
@@ -386,9 +390,12 @@ class TopologyGraph:
                     targets.append(node_id)
 
             if home is None:
-                home = next(
+                # Public: sit in the resource group holding the VNet its
+                # backends live in, which draws it above that VNet's box.
+                vnet_id = next(
                     (node_vnets[t] for t in targets if t in node_vnets), None
                 )
+                home = vnet_rgs.get(vnet_id) if vnet_id else None
             if home is None:
                 logger.warning(
                     f"Load balancer {lb['name']}: no frontend subnet and no "
