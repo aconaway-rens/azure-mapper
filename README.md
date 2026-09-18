@@ -59,6 +59,14 @@ else; no topology data leaves the host it runs on.
 - **No outbound internet required** — frontend libraries are vendored, so the app
   works on locked-down hosts that can only reach Azure
 
+## Tools
+
+[`tools/Get-AzureNetworkState.ps1`](tools/Get-AzureNetworkState.ps1) prints the
+same objects as text rather than drawing them — VMs and interfaces, load
+balancers, NSGs, route tables, optional backend health — for pasting into a
+ticket or an email. It reads through the Azure CLI and runs on its own, with no
+dependency on the app. See [tools/README.md](tools/README.md).
+
 ## Prerequisites
 
 - Docker and Docker Compose (or Python 3.12+ to run it directly)
@@ -107,28 +115,28 @@ Azure Mapper ships as source you build yourself — there's no published package
 or container image. Clone the latest release:
 
 ```bash
-git clone --depth 1 --branch v1.5.1 https://github.com/aconaway-rens/azure-mapper.git
+git clone --depth 1 --branch v1.6.0 https://github.com/aconaway-rens/azure-mapper.git
 cd azure-mapper
 ```
 
 Or, without git, download the release tarball:
 
 ```bash
-curl -L https://github.com/aconaway-rens/azure-mapper/archive/refs/tags/v1.5.1.tar.gz | tar xz
-cd azure-mapper-1.5.1
+curl -L https://github.com/aconaway-rens/azure-mapper/archive/refs/tags/v1.6.0.tar.gz | tar xz
+cd azure-mapper-1.6.0
 ```
 
 Both give you the same tree with Cytoscape.js vendored in, so the build pulls
 nothing from the internet beyond GitHub itself and PyPI. See the
 [releases page](https://github.com/aconaway-rens/azure-mapper/releases) for the
-current version — substitute it for `v1.5.1` above, or drop `--branch v1.5.1`
+current version — substitute it for `v1.6.0` above, or drop `--branch v1.6.0`
 to track `main`.
 
 To move a clone to a newer release later:
 
 ```bash
 git fetch --tags
-git checkout v1.5.1          # whichever release you're moving to
+git checkout v1.6.0          # whichever release you're moving to
 docker compose up -d --build
 ```
 
