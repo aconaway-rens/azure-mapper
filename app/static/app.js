@@ -519,6 +519,7 @@ async function renderGraph(subscriptionId) {
         document.getElementById('infoSub').textContent = subscriptionId;
         document.getElementById('graphInfo').style.display = 'block';
         document.getElementById('limitSection').style.display = 'block';
+        document.getElementById('exportSection').style.display = 'block';
         reportCollapsed();
 
     } catch (e) {
@@ -1259,6 +1260,78 @@ function backToOverview() {
 }
 
 /**
+ * Hand the browser a file to save.
+ *
+ * Split out so the export paths can be exercised without a real DOM.
+ */
+function triggerDownload(filename, href) {
+    const link = document.createElement('a');
+    link.href = href;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+}
+
+/**
+ * A filename stem naming what was scanned and when.
+ */
+function exportBaseName() {
+    const select = document.getElementById('subscriptionSelect');
+    const chosen = select.selectedIndex > 0
+        ? select.options[select.selectedIndex].text.replace(/\s*\(.*\)\s*$/, '')
+        : 'azure';
+    const slug = chosen.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    return `azure-mapper-${slug || 'scan'}-${new Date().toISOString().slice(0, 10)}`;
+}
+
+/**
+ * Export the diagram as a PNG.
+ *
+ * Cytoscape renders what is currently on the canvas, so the image matches the
+ * view: filtered-out resource groups and collapsed subnets stay out of it.
+ */
+function exportGraphImage() {
+    if (!cy || cy.elements(':visible').length === 0) {
+        showStatus('exportStatus', 'Nothing to export — run a scan first', 'error');
+        return;
+    }
+    try {
+        const png = cy.png({ full: true, scale: 2, bg: '#ffffff' });
+        triggerDownload(`${exportBaseName()}.png`, png);
+        showStatus('exportStatus', 'Diagram saved as PNG', 'success');
+    } catch (e) {
+        showStatus('exportStatus', `PNG export failed: ${e.message}`, 'error');
+    }
+}
+
+/**
+ * Export the underlying graph as JSON.
+ *
+ * This comes from the server rather than the canvas, so it carries the whole
+ * scan — including the cards of collapsed subnets, which aren't on screen.
+ */
+async function exportGraphJson() {
+    try {
+        const res = await fetch('/api/graph/json');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'No scan data available');
+
+        const blob = new Blob([JSON.stringify(data, null, 2)],
+                              { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        triggerDownload(`${exportBaseName()}.json`, url);
+        URL.revokeObjectURL(url);
+
+        const counts = data.graph && data.graph.nodes
+            ? ` (${Object.keys(data.graph.nodes).length} nodes)` : '';
+        showStatus('exportStatus', `Graph saved as JSON${counts}`, 'success');
+    } catch (e) {
+        showStatus('exportStatus', `JSON export failed: ${e.message}`, 'error');
+    }
+}
+
+/**
  * Clear the graph
  */
 async function clearGraph() {
@@ -1272,6 +1345,7 @@ async function clearGraph() {
         expandedSubnets = new Set();
         document.getElementById('rgFilterSection').style.display = 'none';
         document.getElementById('rgStatus').style.display = 'none';
+        document.getElementById('exportSection').style.display = 'none';
         document.getElementById('graphInfo').style.display = 'none';
         showStatus('scanStatus', 'Graph cleared', 'success');
     } catch (e) {

@@ -23,6 +23,7 @@
 │  │  │  │  Resource-group filter (display-only, client-side) │  │   │  │
 │  │  │  │  Per-subnet render limit; busy subnets collapse    │  │   │  │
 │  │  │  │  Custom manual layout engine                       │  │   │  │
+│  │  │  │  PNG export (cy.png) / JSON export (/api/graph/json)│  │   │  │
 │  │  │  └────────────────────────────────────────────────────┘  │   │  │
 │  │  └──────────────────────────────────────────────────────────┘   │  │
 │  └──────────────────────────────────────────────────────────────────┘  │

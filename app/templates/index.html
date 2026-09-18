@@ -58,6 +58,14 @@
             margin-bottom: 20px;
         }
 
+        .version {
+            font-size: 11px;
+            font-weight: 500;
+            color: #888;
+            letter-spacing: 0;
+            text-transform: none;
+        }
+
         .section h3 {
             font-size: 14px;
             font-weight: 600;
@@ -280,7 +288,7 @@
     <div class="container">
         <div class="sidebar">
             <div class="section">
-                <h3>Azure Mapper</h3>
+                <h3>Azure Mapper <span class="version">v{{ version }}</span></h3>
                 <div id="authStatus" class="status">Checking Azure credential…</div>
                 <div id="tenantInfo" style="display:none; font-size:11px; color:#777; margin-bottom:8px; word-break:break-all;"></div>
             </div>
@@ -399,6 +407,17 @@
                         <span>LB &rarr; backend members</span>
                     </div>
                 </div>
+            </div>
+
+            <div class="section" id="exportSection" style="display:none;">
+                <h3>Export</h3>
+                <button onclick="exportGraphImage()">Download PNG</button>
+                <button onclick="exportGraphJson()">Download JSON</button>
+                <div class="field-hint">
+                    The PNG matches what's on screen, filters and all. The JSON
+                    is the whole scan, including collapsed subnets.
+                </div>
+                <div id="exportStatus" class="status" style="display:none;"></div>
             </div>
 
             <div class="section">

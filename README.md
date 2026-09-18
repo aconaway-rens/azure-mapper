@@ -48,6 +48,9 @@ else; no topology data leaves the host it runs on.
   diagram; the canvas re-packs around what's left, and the sidebar reports any
   peerings that now run off to a hidden resource group. Filtering is local to
   the browser, so toggling groups never re-queries Azure.
+- **Export** — download the diagram as a PNG (matching what's on screen,
+  filters and all) or the whole scan as JSON, including the contents of
+  collapsed subnets. The running version is shown in the sidebar.
 - **No outbound internet required** — frontend libraries are vendored, so the app
   works on locked-down hosts that can only reach Azure
 

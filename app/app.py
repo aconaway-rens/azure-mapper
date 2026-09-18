@@ -14,6 +14,7 @@ from flask import Flask, render_template, jsonify, request
 
 from azure_ingest import AzureResourceIngestor, describe_identity
 from graph_builder import TopologyGraph
+from version import __version__
 
 # Load app/.env for local runs (Docker injects these via env_file).
 load_dotenv()
@@ -42,7 +43,7 @@ def get_ingestor():
 @app.route("/", methods=["GET"])
 def index():
     """Serve the main UI."""
-    return render_template("index.html")
+    return render_template("index.html", version=__version__)
 
 
 @app.route("/api/health", methods=["GET"])
@@ -50,6 +51,7 @@ def health():
     """Health check endpoint."""
     return jsonify({
         "status": "healthy",
+        "version": __version__,
         "graph_available": current_graph is not None,
     })
 
