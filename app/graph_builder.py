@@ -109,6 +109,13 @@ class TopologyGraph:
         # vm_id -> {vnet node, [nic node ids]}, filled in as subnets are walked
         spanning_attachments: Dict[str, Dict[str, Any]] = {}
 
+        # Lookups the load-balancer pass needs. A backend NIC may have no node
+        # of its own — a NIC on a single-subnet VM is folded into that VM's
+        # card — so nic_nodes maps a NIC to whatever now stands for it.
+        subnet_nodes: Dict[str, str] = {}
+        nic_nodes: Dict[str, str] = {}
+        node_vnets: Dict[str, str] = {}
+
         # Track resource groups so we create each one only once
         resource_groups = set()
 
@@ -170,15 +177,23 @@ class TopologyGraph:
                         # stay accurate even when the children aren't drawn.
                         "nic_count": len(subnet_nics),
                         "vm_count": len(vm_ids),
+                        "lb_count": 0,
                     },
                 )
 
+                subnet_nodes[(subnet["id"] or "").lower()] = subnet_node_id
+                node_vnets[subnet_node_id] = vnet_id
+
                 self._add_subnet_workloads(
                     subnet_node_id, vnet_id, subnet_nics, vms_by_id,
-                    spanning_vms, spanning_attachments,
+                    spanning_vms, spanning_attachments, nic_nodes, node_vnets,
                 )
 
         self._add_spanning_vms(spanning_attachments, vms_by_id)
+        self._add_load_balancers(
+            scan_data.get("load_balancers", []),
+            subnet_nodes, nic_nodes, node_vnets,
+        )
 
         # Create peering edges
         for peering in peerings:
@@ -208,6 +223,8 @@ class TopologyGraph:
         vms_by_id: Dict[str, Dict[str, Any]],
         spanning_vms: set,
         spanning_attachments: Dict[str, Dict[str, Any]],
+        nic_nodes: Dict[str, str],
+        node_vnets: Dict[str, str],
     ) -> None:
         """Add the VM and NIC nodes living inside one subnet.
 
@@ -239,11 +256,16 @@ class TopologyGraph:
                     vm_id, {"vnet": vnet_node_id, "nics": []}
                 )
                 entry["nics"].append(nic_node_id)
+                nic_nodes[nic["id"].lower()] = nic_node_id
+                node_vnets[nic_node_id] = vnet_node_id
             elif vm_id:
                 vm_nics.setdefault(vm_id, []).append(nic)
             else:
+                orphan_node_id = f"nic_{subnet_node_id}_{nic['name']}"
+                nic_nodes[nic["id"].lower()] = orphan_node_id
+                node_vnets[orphan_node_id] = vnet_node_id
                 self.add_node(
-                    f"nic_{subnet_node_id}_{nic['name']}",
+                    orphan_node_id,
                     "nic",
                     f"{nic['name']}\n{nic.get('private_ip') or 'no IP'}",
                     parent=subnet_node_id,
@@ -281,6 +303,13 @@ class TopologyGraph:
                 parent=vm_node_id,
                 data={},
             )
+
+            # A NIC folded into a VM card has no node of its own, so anything
+            # pointing at that NIC — a load balancer's backend pool — must
+            # point at the card instead.
+            node_vnets[vm_node_id] = vnet_node_id
+            for nic in nics:
+                nic_nodes[nic["id"].lower()] = vm_node_id
 
     def _add_spanning_vms(
         self,
@@ -323,6 +352,83 @@ class TopologyGraph:
 
             for nic_node_id in entry["nics"]:
                 self.add_edge(vm_node_id, nic_node_id, "attached_to", {})
+
+    def _add_load_balancers(
+        self,
+        balancers: List[Dict[str, Any]],
+        subnet_nodes: Dict[str, str],
+        nic_nodes: Dict[str, str],
+        node_vnets: Dict[str, str],
+    ) -> None:
+        """Add a node per load balancer, wired to what it balances.
+
+        An internal LB has a frontend in a subnet and is drawn inside it. A
+        public one has no subnet at all, so it hangs off the VNet its backend
+        members live in — the same place a subnet-spanning VM goes. An LB whose
+        members are absent from this scan has nowhere to sit and is skipped
+        rather than left unparented, which would drop it out of the layout.
+        """
+        for lb in balancers:
+            targets: List[str] = []
+            home = None
+            internal = False
+
+            for frontend in lb.get("frontends", []):
+                subnet_id = frontend.get("subnet_id")
+                if subnet_id and subnet_id in subnet_nodes:
+                    home = subnet_nodes[subnet_id]
+                    internal = True
+                    break
+
+            for nic_id in lb.get("backend_nic_ids", []):
+                node_id = nic_nodes.get(nic_id)
+                if node_id and node_id not in targets:
+                    targets.append(node_id)
+
+            if home is None:
+                home = next(
+                    (node_vnets[t] for t in targets if t in node_vnets), None
+                )
+            if home is None:
+                logger.warning(
+                    f"Load balancer {lb['name']}: no frontend subnet and no "
+                    f"backend NIC in this scan — not drawn"
+                )
+                continue
+
+            frontend_ip = next(
+                (f.get("private_ip") for f in lb.get("frontends", [])
+                 if f.get("private_ip")), None
+            )
+            has_public = any(f.get("public") for f in lb.get("frontends", []))
+            caption = frontend_ip or (
+                "public frontend" if has_public else "no frontend IP"
+            )
+
+            lb_node_id = f"lb_{lb['resource_group']}_{lb['name']}"
+            self.add_node(
+                lb_node_id, "lb", f"{lb['name']}\n{caption}",
+                parent=home,
+                data={
+                    "azure_id": lb["id"],
+                    "sku": lb.get("sku", ""),
+                    "internal": internal,
+                    "frontend_ip": frontend_ip,
+                    "rule_count": lb.get("rule_count", 0),
+                    "backend_count": len(targets),
+                    "resource_group": lb.get("resource_group", ""),
+                },
+            )
+            node_vnets[lb_node_id] = node_vnets.get(home, home)
+
+            # Count it on its subnet, so the caption can mark a subnet holding
+            # a load balancer even when the cards aren't drawn.
+            host = self.nodes.get(home)
+            if host is not None and host.type == "subnet":
+                host.data["lb_count"] = host.data.get("lb_count", 0) + 1
+
+            for target in targets:
+                self.add_edge(lb_node_id, target, "balances", {})
 
     def to_cytoscape_format(self) -> Dict[str, List[Dict[str, Any]]]:
         """Export graph in Cytoscape.js format.

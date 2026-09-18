@@ -313,8 +313,53 @@ class AzureResourceIngestor:
         )
         return {"nics": nics, "vms": vms}
 
+    def get_load_balancers(self, subscription_id: str) -> List[Dict[str, Any]]:
+        """Fetch every load balancer, with its frontends and backend NICs.
+
+        A backend pool member is an *ipConfiguration* ID; the NIC is its parent
+        resource, so the ID is trimmed back to the NIC before it can be matched
+        against anything else in the scan.
+        """
+        network_client = NetworkManagementClient(
+            self.credential, subscription_id
+        )
+        balancers = []
+
+        for lb in network_client.load_balancers.list_all():
+            frontends = []
+            for frontend in lb.frontend_ip_configurations or []:
+                subnet = getattr(frontend, "subnet", None)
+                frontends.append({
+                    "name": frontend.name,
+                    "private_ip": frontend.private_ip_address,
+                    "subnet_id": subnet.id.lower() if subnet and subnet.id else None,
+                    "public": bool(getattr(frontend, "public_ip_address", None)),
+                })
+
+            backend_nic_ids = set()
+            for pool in lb.backend_address_pools or []:
+                for config in getattr(pool, "backend_ip_configurations", None) or []:
+                    if config and config.id:
+                        backend_nic_ids.add(
+                            config.id.split("/ipConfigurations/")[0].lower()
+                        )
+
+            balancers.append({
+                "id": lb.id,
+                "name": lb.name,
+                "resource_group": lb.id.split("/")[4],
+                "location": lb.location,
+                "sku": lb.sku.name if getattr(lb, "sku", None) else "",
+                "frontends": frontends,
+                "backend_nic_ids": sorted(backend_nic_ids),
+                "rule_count": len(lb.load_balancing_rules or []),
+            })
+
+        logger.info(f"Found {len(balancers)} load balancers")
+        return balancers
+
     def scan_subscription(self, subscription_id: str) -> Dict[str, Any]:
-        """Perform a full scan: VNets, subnets, peerings, NICs, and VMs."""
+        """Perform a full scan: VNets, subnets, peerings, NICs, VMs, and LBs."""
         compute = self.get_nics_and_vms(subscription_id)
         return {
             "subscription_id": subscription_id,
@@ -322,4 +367,5 @@ class AzureResourceIngestor:
             "peerings": self.get_vnet_peerings(subscription_id),
             "nics": compute["nics"],
             "vms": compute["vms"],
+            "load_balancers": self.get_load_balancers(subscription_id),
         }

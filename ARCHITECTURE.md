@@ -18,6 +18,7 @@
 │  │  │  │   RG → VNet → Subnet → VM → detail                 │  │   │  │
 │  │  │  │  Peering edges (VNet↔VNet)                         │  │   │  │
 │  │  │  │  Attachment edges (spanning VM → NIC)              │  │   │  │
+│  │  │  │  Balancing edges (LB → backend members)            │  │   │  │
 │  │  │  │  Drill-down: Subnet → VM cards                     │  │   │  │
 │  │  │  │  Resource-group filter (display-only, client-side) │  │   │  │
 │  │  │  │  Per-subnet render limit; busy subnets collapse    │  │   │  │

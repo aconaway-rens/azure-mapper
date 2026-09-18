@@ -11,7 +11,7 @@ let drillDownActive = false;
 // flat, so past this point the subnet collapses to a marked summary you click
 // into. The cards stay in the graph either way.
 const DEFAULT_RENDER_LIMIT = 10;
-const WORKLOAD_TYPES = ['vm', 'vm_detail', 'nic'];
+const WORKLOAD_TYPES = ['vm', 'vm_detail', 'nic', 'lb'];
 
 let renderLimit = DEFAULT_RENDER_LIMIT;
 // Subnets expanded by an explicit drill-down, overriding the limit.
@@ -19,6 +19,9 @@ let expandedSubnets = new Set();
 // Workload cards per subnet, held aside so a collapsed subnet can drop its
 // contents from the graph entirely and get them back without a rescan.
 let workloadsBySubnet = {};
+// Attachment and balancing edges, kept whole rather than per subnet: either
+// end of one can be collapsed away, so they're re-wired by checking both.
+let workloadEdges = [];
 let totalVmCount = 0;
 
 // Resource-group filter state. `allResourceGroups` is every RG in the current
@@ -176,7 +179,7 @@ function topologyStyles() {
             // A subnet holding workloads, marked whether or not its cards are
             // drawn — this is what makes a collapsed subnet findable.
             {
-                selector: 'node[type="subnet"][?nic_count]',
+                selector: 'node[type="subnet"][?nic_count], node[type="subnet"][?lb_count]',
                 style: {
                     'border-color': '#8661c5',
                     'border-width': 2,
@@ -270,6 +273,36 @@ function topologyStyles() {
                     'border-style': 'dashed',
                 }
             },
+            // Load balancer
+            {
+                selector: 'node[type="lb"]',
+                style: {
+                    'shape': 'roundrectangle',
+                    'background-color': '#0f9b8e',
+                    'border-color': '#0b7a70',
+                    'border-width': 2,
+                    'width': 170,
+                    'height': 50,
+                    'font-size': 9,
+                    'color': '#fff',
+                    'text-wrap': 'wrap',
+                    'text-max-width': '155px',
+                    'text-valign': 'center',
+                }
+            },
+            // Links a load balancer to the members it balances
+            {
+                selector: 'edge[type="balances"]',
+                style: {
+                    'line-color': '#0f9b8e',
+                    'target-arrow-color': '#0f9b8e',
+                    'target-arrow-shape': 'triangle',
+                    'line-style': 'dotted',
+                    'width': 2,
+                    'curve-style': 'bezier',
+                    'arrow-scale': 0.8,
+                }
+            },
             // Links a spanning VM to its NIC in each subnet
             {
                 selector: 'edge[type="attached_to"]',
@@ -343,11 +376,13 @@ function subnetLabel(ele) {
     const data = ele.data();
     const vms = data.vm_count || 0;
     const nics = data.nic_count || 0;
-    if (nics === 0) return data.label;
+    const lbs = data.lb_count || 0;
+    if (nics === 0 && lbs === 0) return data.label;
 
     const parts = [];
     if (vms > 0) parts.push(`${vms} VM${vms === 1 ? '' : 's'}`);
-    parts.push(`${nics} NIC${nics === 1 ? '' : 's'}`);
+    if (nics > 0) parts.push(`${nics} NIC${nics === 1 ? '' : 's'}`);
+    if (lbs > 0) parts.push(`${lbs} LB${lbs === 1 ? '' : 's'}`);
 
     let text = `${data.label}\n${parts.join(' · ')}`;
     if (data.collapsed) text += '\nclick to expand';
@@ -518,13 +553,32 @@ function layoutTopology(rgNodes) {
     }
 
     function layoutVnet(vnet, x, y) {
+        const rowTop = y + VNET_PAD;
         let subnetX = x + VNET_PAD;
-        let subnetBottom = y + VNET_PAD;
+        const placed = [];
 
         vnet.children('[type="subnet"]').forEach(function(subnet) {
-            const size = layoutSubnet(subnet, subnetX, y + VNET_PAD);
+            const size = layoutSubnet(subnet, subnetX, rowTop);
+            placed.push(subnet);
             subnetX += size.w + SUBNET_GAP;
-            subnetBottom = Math.max(subnetBottom, y + VNET_PAD + size.h);
+        });
+
+        // A subnet with cards in it captions itself *above* its box; an empty
+        // or collapsed one captions inside. Lining up the outer bounding boxes
+        // therefore pushes the populated ones down by the height of their
+        // caption, leaving an empty subnet like GatewaySubnet visibly out of
+        // rank with its neighbours. Line up the boxes instead, and reserve the
+        // tallest caption's worth of room above the row so nothing rides up
+        // over the VNet's own border.
+        const captions = placed.map(captionHeight);
+        const tallest = captions.reduce(function(m, h) { return Math.max(m, h); }, 0);
+        placed.forEach(function(subnet, i) {
+            shiftBy(subnet, 0, tallest - captions[i]);
+        });
+
+        let subnetBottom = rowTop;
+        placed.forEach(function(subnet) {
+            subnetBottom = Math.max(subnetBottom, subnet.boundingBox().y2);
         });
 
         // A VM spanning subnets is a child of the VNet, not of any subnet. It
@@ -532,7 +586,7 @@ function layoutTopology(rgNodes) {
         // left-justified: its links reach across every subnet it serves, so
         // starting from the left corner drags them all diagonally across the
         // diagram instead of letting them fan out evenly.
-        const spanning = vnet.children('[type="vm"]');
+        const spanning = vnet.children('[type="vm"], [type="lb"]');
         if (spanning.length > 0) {
             const subnetRowWidth = Math.max(subnetX - SUBNET_GAP - (x + VNET_PAD), 0);
             const vmRowWidth = spanning.length * CARD_W +
@@ -586,19 +640,36 @@ function layoutTopology(rgNodes) {
      */
     function alignAndMeasure(ele, x, y) {
         let bb = ele.boundingBox();
-        const dx = x - bb.x1, dy = y - bb.y1;
-
-        if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
-            const movable = ele.isChildless()
-                ? ele
-                : ele.descendants().filter(function(n) { return n.isChildless(); });
-            movable.forEach(function(n) {
-                const p = n.position();
-                n.position({ x: p.x + dx, y: p.y + dy });
-            });
-            bb = ele.boundingBox();
-        }
+        shiftBy(ele, x - bb.x1, y - bb.y1);
+        bb = ele.boundingBox();
         return { w: bb.w, h: bb.h };
+    }
+
+    /**
+     * How far a node's caption rises above its own box. Zero when the caption
+     * sits inside, as it does on an empty or collapsed subnet.
+     */
+    function captionHeight(ele) {
+        return Math.max(
+            ele.boundingBox({ includeLabels: false }).y1 - ele.boundingBox().y1,
+            0
+        );
+    }
+
+    /**
+     * Move a node and everything inside it. Only leaves can be positioned —
+     * Cytoscape derives a compound's position from its children — so the shift
+     * is applied to the childless nodes underneath.
+     */
+    function shiftBy(ele, dx, dy) {
+        if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+        const movable = ele.isChildless()
+            ? ele
+            : ele.descendants().filter(function(n) { return n.isChildless(); });
+        movable.forEach(function(n) {
+            const p = n.position();
+            n.position({ x: p.x + dx, y: p.y + dy });
+        });
     }
 }
 
@@ -784,24 +855,48 @@ function syncWorkloadCards() {
             subnet.descendants().remove();
         }
     });
+
+    syncWorkloadEdges();
 }
 
 /**
- * Group the scan's VM and NIC cards by the subnet they belong to.
+ * Re-wire any attachment or balancing edge whose endpoints are both present.
  *
- * Only cards a subnet owns are indexed. A VM that spans subnets is parented to
- * the VNet and stays in the graph permanently — it belongs to no one subnet,
- * so no one subnet gets to collapse it away.
+ * Cytoscape drops an edge when either endpoint is removed, so collapsing a
+ * subnet tears down its links for free. Putting them back is the part that
+ * needs doing, and only for edges that have both ends to hold on to: a peering
+ * to a filtered-out VNet, or a balancer inside a collapsed subnet, stays gone.
+ */
+function syncWorkloadEdges() {
+    const missing = workloadEdges.filter(function(edge) {
+        return cy.getElementById(edge.data.id).length === 0 &&
+               cy.getElementById(edge.data.source).length > 0 &&
+               cy.getElementById(edge.data.target).length > 0;
+    });
+    if (missing.length > 0) {
+        cy.add(missing.map(function(edge) {
+            return { data: Object.assign({}, edge.data) };
+        }));
+    }
+}
+
+/**
+ * Group the scan's workload cards by the subnet they belong to.
  *
- * Order matters on the way back in: a VM has to exist before the detail card
- * naming it as parent, and both endpoints of an attachment edge have to exist
- * before the edge does. Nodes are therefore emitted ahead of edges.
+ * Only cards a subnet owns are indexed. A VM spanning subnets, or a public
+ * load balancer with no subnet at all, is parented to the VNet and stays in
+ * the graph permanently — neither belongs to any one subnet, so no one subnet
+ * gets to collapse it away.
+ *
+ * Edges are held apart from the subnet index because either end of one can be
+ * collapsed: a load balancer inside a busy subnet can vanish while the members
+ * it balances stay drawn. They're re-wired by checking both ends instead.
  */
 function indexWorkloads(elements) {
     const subnetIds = new Set();
     const vmToSubnet = {};
-    const nicToSubnet = {};
     workloadsBySubnet = {};
+    workloadEdges = [];
     totalVmCount = 0;
 
     elements.forEach(function(el) {
@@ -815,19 +910,18 @@ function indexWorkloads(elements) {
 
     elements.forEach(function(el) {
         const d = el.data;
-        if ((d.type === 'vm' || d.type === 'nic') && subnetIds.has(d.parent)) {
+        if (d.source) {
+            workloadEdges.push(el);
+        } else if (WORKLOAD_TYPES.indexOf(d.type) !== -1 && subnetIds.has(d.parent)) {
             if (d.type === 'vm') vmToSubnet[d.id] = d.parent;
-            else nicToSubnet[d.id] = d.parent;
             own(d.parent, el);
         }
     });
+    // A VM's detail card rides with the VM, so it lands in the same subnet —
+    // and after it, since a parent must exist before its child.
     elements.forEach(function(el) {
         const d = el.data;
         if (d.type === 'vm_detail' && vmToSubnet[d.parent]) own(vmToSubnet[d.parent], el);
-    });
-    elements.forEach(function(el) {
-        const d = el.data;
-        if (d.source && nicToSubnet[d.target]) own(nicToSubnet[d.target], el);
     });
 }
 
@@ -928,7 +1022,7 @@ function drillDownToSubnet(subnetNode) {
     if (drillDownActive) return;
 
     const subnetData = subnetNode.data();
-    if (!subnetData.nic_count) {
+    if (!subnetData.nic_count && !subnetData.lb_count) {
         showStatus('detailStatus', 'No NICs or VMs in this subnet', 'info');
         return;
     }
@@ -949,7 +1043,8 @@ function drillDownToSubnet(subnetNode) {
     // Dim everything that isn't this subnet, its contents, or its containers.
     // A VM spanning subnets lives outside this one but is half the story of
     // what's in it, so anything wired to a NIC in here stays lit too.
-    const linked = subnetNode.descendants().neighborhood('node[type="vm"]');
+    const linked = subnetNode.descendants()
+        .neighborhood('node[type="vm"], node[type="lb"]');
     const keep = subnetNode
         .union(subnetNode.ancestors())
         .union(subnetNode.descendants())
@@ -999,6 +1094,18 @@ function renderSubnetDetail(subnetNode) {
             if (d.vm_size) line += ` (${d.vm_size})`;
             if (d.os_type) line += ` - ${d.os_type}`;
             if (d.private_ips) line += ` - ${d.private_ips}`;
+            html += `<div class="detail-item">${line}</div>`;
+        });
+    }
+
+    const lbs = subnetNode.children('[type="lb"]');
+    if (lbs.length > 0) {
+        html += `<div class="detail-item"><span class="detail-label">Load balancers (${lbs.length}):</span></div>`;
+        lbs.forEach(function(lb) {
+            const d = lb.data();
+            let line = `&nbsp;&nbsp;${d.label.replace('\n', ' - ')}`;
+            if (d.sku) line += ` (${d.sku})`;
+            line += ` &rarr; ${d.backend_count} backend${d.backend_count === 1 ? '' : 's'}`;
             html += `<div class="detail-item">${line}</div>`;
         });
     }

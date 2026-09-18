@@ -21,6 +21,10 @@ else; no topology data leaves the host it runs on.
 - **VMs and NICs in the diagram** — workloads are drawn inside their subnets,
   with size, OS, and private IPs on each card. Unattached NICs are drawn on
   their own, since an orphaned NIC is usually worth noticing.
+- **Load balancers** — internal LBs are drawn inside their frontend subnet,
+  public ones alongside the VMs at the VNet level, each linked to the backend
+  members it balances. A backend NIC folded into a VM card is linked via that
+  card, so the line always lands on something you can see.
 - **Multi-homed VMs stay one object** — a firewall or NVA with a NIC in four
   subnets is drawn once, at the VNet level, linked to its NIC in each subnet,
   rather than as four unrelated VMs. Azure requires every NIC on a VM to sit in
