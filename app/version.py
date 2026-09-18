@@ -5,4 +5,4 @@ git metadata — reports the same version as a clone. Bump this in the same
 commit that pins the README's install instructions to a new tag.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
