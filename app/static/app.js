@@ -255,12 +255,14 @@ function topologyStyles() {
                     'background-color': '#ff8c00',
                     'border-color': '#cc7000',
                     'border-width': 1,
-                    'width': 140,
-                    'height': 40,
+                    // Room for name, private IP, and — when it has them — a
+                    // public IP and an NSG name.
+                    'width': 165,
+                    'height': 62,
                     'font-size': 9,
                     'color': '#fff',
                     'text-wrap': 'wrap',
-                    'text-max-width': '130px',
+                    'text-max-width': '155px',
                 }
             },
             // NIC with no VM behind it — flagged, since an orphan NIC is
@@ -342,12 +344,12 @@ function topologyStyles() {
                     'shape': 'roundrectangle',
                     'background-color': '#7451b0',
                     'border-width': 0,
-                    'width': 160,
-                    'height': 40,
+                    'width': 165,
+                    'height': 58,
                     'font-size': 8,
                     'color': '#ddd',
                     'text-wrap': 'wrap',
-                    'text-max-width': '150px',
+                    'text-max-width': '158px',
                     'text-valign': 'center',
                     'text-halign': 'center',
                 }
@@ -390,14 +392,15 @@ function subnetLabel(ele) {
     const vms = data.vm_count || 0;
     const nics = data.nic_count || 0;
     const lbs = data.lb_count || 0;
-    if (nics === 0 && lbs === 0) return data.label;
+    const nsg = data.nsg_name ? `\nNSG ${data.nsg_name}` : '';
+    if (nics === 0 && lbs === 0) return data.label + nsg;
 
     const parts = [];
     if (vms > 0) parts.push(`${vms} VM${vms === 1 ? '' : 's'}`);
     if (nics > 0) parts.push(`${nics} NIC${nics === 1 ? '' : 's'}`);
     if (lbs > 0) parts.push(`${lbs} LB${lbs === 1 ? '' : 's'}`);
 
-    let text = `${data.label}\n${parts.join(' · ')}`;
+    let text = `${data.label}\n${parts.join(' · ')}${nsg}`;
     if (data.collapsed) text += '\nclick to expand';
     return text;
 }
@@ -1179,6 +1182,9 @@ function renderSubnetDetail(subnetNode) {
         </div>
     `;
 
+    html += `<div class="detail-item"><span class="detail-label">NSG:</span> ` +
+            `${data.nsg_name || 'none attached'}</div>`;
+
     if (vms.length > 0) {
         html += `<div class="detail-item"><span class="detail-label">VMs (${vms.length}):</span></div>`;
         vms.forEach(function(vm) {
@@ -1188,6 +1194,7 @@ function renderSubnetDetail(subnetNode) {
             if (d.os_type) line += ` - ${d.os_type}`;
             if (d.private_ips) line += ` - ${d.private_ips}`;
             if (d.public_ips) line += ` - <strong>public ${d.public_ips}</strong>`;
+            if (d.nsg_names) line += ` - NSG ${d.nsg_names}`;
             html += `<div class="detail-item">${line}</div>`;
         });
     }
@@ -1214,6 +1221,7 @@ function renderSubnetDetail(subnetNode) {
             const d = nic.data();
             let line = `&nbsp;&nbsp;${d.label.split('\n').slice(0, 2).join(' - ')}`;
             if (d.public_ip) line += ` - <strong>public ${d.public_ip}</strong>`;
+            if (d.nsg_name) line += ` - NSG ${d.nsg_name}`;
             if (d.vm_name) line += ` &rarr; ${d.vm_name}`;
             html += `<div class="detail-item">${line}</div>`;
         });

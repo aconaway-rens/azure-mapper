@@ -120,6 +120,7 @@ class AzureResourceIngestor:
                         "name": subnet.name,
                         "address_prefix": subnet.address_prefix,
                         "vnet_name": vnet.name,
+                        "nsg_name": self._nsg_name_of(subnet),
                     }
                     vnets_data[vnet_key]["subnets"].append(subnet_data)
 
@@ -278,6 +279,18 @@ class AzureResourceIngestor:
         return public_ips
 
     @staticmethod
+    def _nsg_name_of(owner: Any) -> Optional[str]:
+        """Name the NSG attached to a subnet or NIC, if one is.
+
+        The attachment is a reference carrying the NSG's resource ID, and a
+        resource's name is the last segment of its ID — so the name comes for
+        free, with no extra call to list the NSGs themselves.
+        """
+        nsg = getattr(owner, "network_security_group", None)
+        nsg_id = getattr(nsg, "id", None) if nsg else None
+        return nsg_id.split("/")[-1] if nsg_id else None
+
+    @staticmethod
     def _public_ip_of(reference: Any, public_ips: Dict[str, Dict[str, Any]]):
         """Resolve a public IP reference to its address, if it has one yet."""
         if not reference or not getattr(reference, "id", None):
@@ -331,6 +344,7 @@ class AzureResourceIngestor:
                 nic.virtual_machine.id if nic.virtual_machine else None
             )
             vm = vms.get(vm_id.lower()) if vm_id else None
+            nic_nsg = self._nsg_name_of(nic)
 
             # A NIC can hold several ipconfigs, each potentially on its own
             # subnet. Emit one record per subnet-bearing ipconfig so the NIC
@@ -347,6 +361,7 @@ class AzureResourceIngestor:
                         getattr(ip_config, "public_ip_address", None),
                         public_ips,
                     ),
+                    "nsg_name": nic_nsg,
                     "vm_id": vm_id,
                     "vm_name": vm["name"] if vm else None,
                 })

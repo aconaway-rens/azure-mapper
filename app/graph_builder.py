@@ -58,6 +58,8 @@ def _nic_label(nic: Dict[str, Any]) -> str:
     lines = [nic["name"], nic.get("private_ip") or "no IP"]
     if nic.get("public_ip"):
         lines.append(f"public {nic['public_ip']}")
+    if nic.get("nsg_name"):
+        lines.append(f"NSG {nic['nsg_name']}")
     return "\n".join(lines)
 
 
@@ -190,6 +192,7 @@ class TopologyGraph:
                         "address_prefix": addr,
                         # The frontend marks and collapses on these, so they
                         # stay accurate even when the children aren't drawn.
+                        "nsg_name": subnet.get("nsg_name"),
                         "nic_count": len(subnet_nics),
                         "vm_count": len(vm_ids),
                         "lb_count": 0,
@@ -263,6 +266,7 @@ class TopologyGraph:
                         "azure_id": nic["id"],
                         "private_ip": nic.get("private_ip"),
                         "public_ip": nic.get("public_ip"),
+                        "nsg_name": nic.get("nsg_name"),
                         "vm_name": nic.get("vm_name"),
                         "orphan": False,
                     },
@@ -288,6 +292,7 @@ class TopologyGraph:
                         "azure_id": nic["id"],
                         "private_ip": nic.get("private_ip"),
                         "public_ip": nic.get("public_ip"),
+                        "nsg_name": nic.get("nsg_name"),
                         "orphan": True,
                     },
                 )
@@ -302,6 +307,14 @@ class TopologyGraph:
             public = ", ".join(
                 n["public_ip"] for n in nics if n.get("public_ip")
             )
+            # These NICs get no node of their own, so a NIC-level NSG would
+            # otherwise be invisible. Distinct names only: two NICs behind the
+            # same NSG shouldn't read as two.
+            nsgs = []
+            for n in nics:
+                if n.get("nsg_name") and n["nsg_name"] not in nsgs:
+                    nsgs.append(n["nsg_name"])
+            nsg_names = ", ".join(nsgs)
 
             self.add_node(
                 vm_node_id, "vm", vm_name,
@@ -312,6 +325,7 @@ class TopologyGraph:
                     "os_type": vm.get("os_type", ""),
                     "private_ips": ips,
                     "public_ips": public,
+                    "nsg_names": nsg_names,
                     "nic_names": [n["name"] for n in nics],
                 },
             )
@@ -319,6 +333,7 @@ class TopologyGraph:
             detail = [p for p in (
                 vm.get("vm_size"), vm.get("os_type"), ips,
                 f"public {public}" if public else "",
+                f"NSG {nsg_names}" if nsg_names else "",
             ) if p]
             self.add_node(
                 f"{vm_node_id}_detail", "vm_detail",
