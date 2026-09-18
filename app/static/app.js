@@ -352,6 +352,19 @@ function topologyStyles() {
                     'text-halign': 'center',
                 }
             },
+            // Internet-facing: a NIC, VM card or load balancer holding a
+            // public IP. Worth spotting without reading every caption.
+            //
+            // Kept last of the node rules on purpose — Cytoscape gives later
+            // rules precedence, so anywhere above the per-type styles this
+            // border would be overwritten by them.
+            {
+                selector: 'node[?public_ip], node[?public_ips]',
+                style: {
+                    'border-color': '#d13438',
+                    'border-width': 3,
+                }
+            },
             // Selected state
             {
                 selector: ':selected',
@@ -1173,6 +1186,7 @@ function renderSubnetDetail(subnetNode) {
             if (d.vm_size) line += ` (${d.vm_size})`;
             if (d.os_type) line += ` - ${d.os_type}`;
             if (d.private_ips) line += ` - ${d.private_ips}`;
+            if (d.public_ips) line += ` - <strong>public ${d.public_ips}</strong>`;
             html += `<div class="detail-item">${line}</div>`;
         });
     }
@@ -1184,6 +1198,7 @@ function renderSubnetDetail(subnetNode) {
             const d = lb.data();
             let line = `&nbsp;&nbsp;${d.label.replace('\n', ' - ')}`;
             if (d.sku) line += ` (${d.sku})`;
+            if (d.public_ip) line += ` - <strong>public ${d.public_ip}</strong>`;
             line += ` &rarr; ${d.backend_count} backend${d.backend_count === 1 ? '' : 's'}`;
             html += `<div class="detail-item">${line}</div>`;
         });
@@ -1196,7 +1211,8 @@ function renderSubnetDetail(subnetNode) {
         html += `<div class="detail-item"><span class="detail-label">NICs of VMs spanning subnets (${attached.length}):</span></div>`;
         attached.forEach(function(nic) {
             const d = nic.data();
-            let line = `&nbsp;&nbsp;${d.label.replace('\n', ' - ')}`;
+            let line = `&nbsp;&nbsp;${d.label.split('\n').slice(0, 2).join(' - ')}`;
+            if (d.public_ip) line += ` - <strong>public ${d.public_ip}</strong>`;
             if (d.vm_name) line += ` &rarr; ${d.vm_name}`;
             html += `<div class="detail-item">${line}</div>`;
         });

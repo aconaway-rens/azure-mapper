@@ -21,6 +21,11 @@ else; no topology data leaves the host it runs on.
 - **VMs and NICs in the diagram** — workloads are drawn inside their subnets,
   with size, OS, and private IPs on each card. Unattached NICs are drawn on
   their own, since an orphaned NIC is usually worth noticing.
+- **Public IPs on the diagram** — a NIC with a public IP shows it under its
+  private one, a VM card shows the public IPs of the NICs folded into it, and a
+  public load balancer shows its frontend address. Anything holding a public IP
+  is outlined in red, so what faces the internet is visible without reading
+  every caption.
 - **Load balancers** — an internal LB is drawn inside its frontend subnet,
   above the workloads it fronts. A public LB belongs to no subnet and to no
   VNet, whatever its backend pool reaches into, so it sits above the VNet box

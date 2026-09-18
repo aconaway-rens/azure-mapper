@@ -251,7 +251,45 @@ class AzureResourceIngestor:
         name = getattr(os_type, "value", None) or str(os_type).split(".")[-1]
         return name.capitalize()
 
-    def get_nics_and_vms(self, subscription_id: str) -> Dict[str, Any]:
+    def get_public_ips(self, subscription_id: str) -> Dict[str, Dict[str, Any]]:
+        """Map every public IP resource ID to its address.
+
+        NIC ip-configs and LB frontends only carry a *reference* to a public IP
+        — the address itself lives on the public IP resource — so one listing
+        here saves a GET per reference later. A public IP that is allocated but
+        not yet assigned has no address, which is why ``ip_address`` can be
+        None even when the resource exists.
+        """
+        network_client = NetworkManagementClient(
+            self.credential, subscription_id
+        )
+        public_ips: Dict[str, Dict[str, Any]] = {}
+
+        for pip in network_client.public_ip_addresses.list_all():
+            dns = getattr(pip, "dns_settings", None)
+            public_ips[pip.id.lower()] = {
+                "id": pip.id,
+                "name": pip.name,
+                "ip_address": pip.ip_address,
+                "fqdn": getattr(dns, "fqdn", None) if dns else None,
+            }
+
+        logger.info(f"Found {len(public_ips)} public IPs")
+        return public_ips
+
+    @staticmethod
+    def _public_ip_of(reference: Any, public_ips: Dict[str, Dict[str, Any]]):
+        """Resolve a public IP reference to its address, if it has one yet."""
+        if not reference or not getattr(reference, "id", None):
+            return None
+        entry = public_ips.get(reference.id.lower())
+        return entry.get("ip_address") if entry else None
+
+    def get_nics_and_vms(
+        self,
+        subscription_id: str,
+        public_ips: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         """Fetch every NIC in the subscription, resolved to its VM and subnet.
 
         This is the subscription-wide counterpart to ``get_subnet_resources``.
@@ -268,6 +306,7 @@ class AzureResourceIngestor:
         compute_client = ComputeManagementClient(
             self.credential, subscription_id
         )
+        public_ips = public_ips if public_ips is not None else {}
 
         # One pass over the VMs, so NIC -> VM resolution is a dict lookup
         # rather than a GET each.
@@ -304,6 +343,10 @@ class AzureResourceIngestor:
                     "name": nic.name,
                     "subnet_id": ip_config.subnet.id.lower(),
                     "private_ip": ip_config.private_ip_address,
+                    "public_ip": self._public_ip_of(
+                        getattr(ip_config, "public_ip_address", None),
+                        public_ips,
+                    ),
                     "vm_id": vm_id,
                     "vm_name": vm["name"] if vm else None,
                 })
@@ -313,7 +356,11 @@ class AzureResourceIngestor:
         )
         return {"nics": nics, "vms": vms}
 
-    def get_load_balancers(self, subscription_id: str) -> List[Dict[str, Any]]:
+    def get_load_balancers(
+        self,
+        subscription_id: str,
+        public_ips: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Fetch every load balancer, with its frontends and backend NICs.
 
         A backend pool member is an *ipConfiguration* ID; the NIC is its parent
@@ -323,17 +370,20 @@ class AzureResourceIngestor:
         network_client = NetworkManagementClient(
             self.credential, subscription_id
         )
+        public_ips = public_ips if public_ips is not None else {}
         balancers = []
 
         for lb in network_client.load_balancers.list_all():
             frontends = []
             for frontend in lb.frontend_ip_configurations or []:
                 subnet = getattr(frontend, "subnet", None)
+                public_ref = getattr(frontend, "public_ip_address", None)
                 frontends.append({
                     "name": frontend.name,
                     "private_ip": frontend.private_ip_address,
                     "subnet_id": subnet.id.lower() if subnet and subnet.id else None,
-                    "public": bool(getattr(frontend, "public_ip_address", None)),
+                    "public": bool(public_ref),
+                    "public_ip": self._public_ip_of(public_ref, public_ips),
                 })
 
             backend_nic_ids = set()
@@ -360,12 +410,15 @@ class AzureResourceIngestor:
 
     def scan_subscription(self, subscription_id: str) -> Dict[str, Any]:
         """Perform a full scan: VNets, subnets, peerings, NICs, VMs, and LBs."""
-        compute = self.get_nics_and_vms(subscription_id)
+        public_ips = self.get_public_ips(subscription_id)
+        compute = self.get_nics_and_vms(subscription_id, public_ips)
         return {
             "subscription_id": subscription_id,
             "vnets": self.get_vnets_and_subnets(subscription_id),
             "peerings": self.get_vnet_peerings(subscription_id),
             "nics": compute["nics"],
             "vms": compute["vms"],
-            "load_balancers": self.get_load_balancers(subscription_id),
+            "load_balancers": self.get_load_balancers(
+                subscription_id, public_ips
+            ),
         }

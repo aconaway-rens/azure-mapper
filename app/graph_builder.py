@@ -48,6 +48,19 @@ class GraphEdge:
         }
 
 
+def _nic_label(nic: Dict[str, Any]) -> str:
+    """Caption for a NIC card: name, private IP, and a public one if it has it.
+
+    A public IP on a NIC is worth reading off the diagram without clicking —
+    it's usually a management interface, and it's the part of the topology
+    facing the internet.
+    """
+    lines = [nic["name"], nic.get("private_ip") or "no IP"]
+    if nic.get("public_ip"):
+        lines.append(f"public {nic['public_ip']}")
+    return "\n".join(lines)
+
+
 class TopologyGraph:
     """Build and manage the logical topology graph."""
 
@@ -244,12 +257,12 @@ class TopologyGraph:
             if vm_id and vm_id in spanning_vms:
                 nic_node_id = f"nic_{subnet_node_id}_{nic['name']}"
                 self.add_node(
-                    nic_node_id, "nic",
-                    f"{nic['name']}\n{nic.get('private_ip') or 'no IP'}",
+                    nic_node_id, "nic", _nic_label(nic),
                     parent=subnet_node_id,
                     data={
                         "azure_id": nic["id"],
                         "private_ip": nic.get("private_ip"),
+                        "public_ip": nic.get("public_ip"),
                         "vm_name": nic.get("vm_name"),
                         "orphan": False,
                     },
@@ -269,11 +282,12 @@ class TopologyGraph:
                 self.add_node(
                     orphan_node_id,
                     "nic",
-                    f"{nic['name']}\n{nic.get('private_ip') or 'no IP'}",
+                    _nic_label(nic),
                     parent=subnet_node_id,
                     data={
                         "azure_id": nic["id"],
                         "private_ip": nic.get("private_ip"),
+                        "public_ip": nic.get("public_ip"),
                         "orphan": True,
                     },
                 )
@@ -283,6 +297,11 @@ class TopologyGraph:
             vm_name = vm.get("name") or nics[0].get("vm_name") or "unknown-vm"
             vm_node_id = f"vm_{subnet_node_id}_{vm_name}"
             ips = ", ".join(n.get("private_ip") or "?" for n in nics)
+            # This card stands for NICs that get no node of their own, so a
+            # public IP on one of them would otherwise vanish from the diagram.
+            public = ", ".join(
+                n["public_ip"] for n in nics if n.get("public_ip")
+            )
 
             self.add_node(
                 vm_node_id, "vm", vm_name,
@@ -292,12 +311,14 @@ class TopologyGraph:
                     "vm_size": vm.get("vm_size", ""),
                     "os_type": vm.get("os_type", ""),
                     "private_ips": ips,
+                    "public_ips": public,
                     "nic_names": [n["name"] for n in nics],
                 },
             )
 
             detail = [p for p in (
                 vm.get("vm_size"), vm.get("os_type"), ips,
+                f"public {public}" if public else "",
             ) if p]
             self.add_node(
                 f"{vm_node_id}_detail", "vm_detail",
@@ -407,10 +428,21 @@ class TopologyGraph:
                 (f.get("private_ip") for f in lb.get("frontends", [])
                  if f.get("private_ip")), None
             )
-            has_public = any(f.get("public") for f in lb.get("frontends", []))
-            caption = frontend_ip or (
-                "public frontend" if has_public else "no frontend IP"
+            public_ip = next(
+                (f.get("public_ip") for f in lb.get("frontends", [])
+                 if f.get("public_ip")), None
             )
+            has_public = any(f.get("public") for f in lb.get("frontends", []))
+
+            if frontend_ip:
+                caption = frontend_ip
+            elif public_ip:
+                caption = f"public {public_ip}"
+            elif has_public:
+                # Allocated but not yet assigned an address.
+                caption = "public frontend"
+            else:
+                caption = "no frontend IP"
 
             lb_node_id = f"lb_{lb['resource_group']}_{lb['name']}"
             self.add_node(
@@ -421,6 +453,7 @@ class TopologyGraph:
                     "sku": lb.get("sku", ""),
                     "internal": internal,
                     "frontend_ip": frontend_ip,
+                    "public_ip": public_ip,
                     "rule_count": lb.get("rule_count", 0),
                     "backend_count": len(targets),
                     "resource_group": lb.get("resource_group", ""),
