@@ -133,6 +133,16 @@ Output is a table by default; `-o json` keeps rules nested under each object,
 (`+13 more`) unless you pass `--full`. Prompts and progress go to stderr, so
 stdout pipes cleanly.
 
+**For Excel, use `--out` rather than `>`:**
+
+```powershell
+python app\azmap.py vms --effective -o csv --out vms.csv
+```
+
+Windows PowerShell 5.1 redirects with `>` as UTF-16, which Excel won't split
+on commas — every row lands in column A. `--out` writes UTF-8 with a BOM and
+Windows line endings, which Excel opens as columns whatever shell you use.
+
 ## Tools
 
 [`tools/Get-AzureNetworkState.ps1`](tools/Get-AzureNetworkState.ps1) prints the

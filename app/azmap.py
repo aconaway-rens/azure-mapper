@@ -17,6 +17,7 @@ or the other layer's NSG, can still block what a matching rule allows.
 """
 
 import argparse
+import contextlib
 import csv
 import fnmatch
 import ipaddress
@@ -808,6 +809,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     common.add_argument("-o", "--output", choices=["table", "json", "csv"], default="table")
+    common.add_argument(
+        "--out", metavar="FILE",
+        help="write the output to FILE instead of the screen; use this rather "
+             "than '>' for a CSV meant for Excel",
+    )
     common.add_argument("--full", action="store_true",
                         help="don't shorten long address and port lists in tables")
 
@@ -881,6 +887,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             selected = [v for v in selected if effective_match(v, args)]
             if unknown:
                 note(f"Couldn't check {len(unknown)} VM(s) without effective rules: {', '.join(unknown)}")
+    if args.out:
+        # Written here rather than through '>': Windows PowerShell 5.1
+        # redirects as UTF-16, which Excel won't split on commas, so every row
+        # lands in column A. UTF-8 with a BOM is what Excel recognises, and
+        # newline="" leaves the csv module's \r\n alone instead of doubling it.
+        encoding = "utf-8-sig" if args.output == "csv" else "utf-8"
+        with open(args.out, "w", encoding=encoding, newline="") as handle, \
+                contextlib.redirect_stdout(handle):
+            render(selected, args, kind)
+        note(f"Wrote {len(selected)} {NOUNS[kind]} to {args.out}")
+    else:
+        if args.output == "csv":
+            # Same doubling on stdout: Windows text mode turns each \r\n
+            # into \r\r\n, which Excel shows as a blank row between rows.
+            sys.stdout.reconfigure(newline="")
+        render(selected, args, kind)
+    return 0
+
+
+def render(selected: List[Dict[str, Any]], args, kind: str) -> None:
     if args.output == "json":
         render_json(selected, args, kind)
     elif args.output == "csv":
@@ -889,7 +915,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         render_table(selected, args, kind)
     else:
         note(f"No {NOUNS[kind]} match.")
-    return 0
 
 
 if __name__ == "__main__":
