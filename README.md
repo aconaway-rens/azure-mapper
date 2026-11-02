@@ -30,7 +30,9 @@ else; no topology data leaves the host it runs on.
   private one, a VM card shows the public IPs of the NICs folded into it, and a
   public load balancer shows its frontend address. Anything holding a public IP
   is outlined in red, so what faces the internet is visible without reading
-  every caption.
+  every caption. A dynamic public IP on a stopped VM has no address until the
+  VM starts, but it's still attached, so it reads `public (unassigned)`
+  rather than disappearing.
 - **Load balancers** — an internal LB is drawn inside its frontend subnet,
   above the workloads it fronts. A public LB belongs to no subnet and to no
   VNet, whatever its backend pool reaches into, so it sits above the VNet box

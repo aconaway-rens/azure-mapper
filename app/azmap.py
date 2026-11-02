@@ -572,10 +572,11 @@ def render_effective_table(vms: List[Dict[str, Any]], args) -> None:
     for i, vm in enumerate(vms):
         if i:
             print()
-        ips = " ".join(ip for n in vm["nics"] for ip in n["private_ips"])
-        print(f"{vm['name']}  ({vm['resource_group']})  {ips}  [{vm['power_state']}]")
+        print(f"{vm['name']}  ({vm['resource_group']})  [{vm['power_state']}]")
         for nic in vm["nics"]:
-            print(f"  NIC {nic['name']}  on {' '.join(nic['subnets'])}")
+            public = f"  public {' '.join(nic['public_ips'])}" if nic["public_ips"] else ""
+            print(f"  NIC {nic['name']}  on {' '.join(nic['subnets'])}"
+                  f"  {' '.join(nic['private_ips'])}{public}")
             if "effective_error" in nic:
                 # Fall back to the NSGs' own rules, so a stopped VM still
                 # answers the question -- labelled, since Azure didn't vouch
@@ -735,14 +736,15 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
     """One row per object, or with rules in play, one row per rule."""
     writer = csv.writer(sys.stdout)
     if args.effective:
-        writer.writerow(["VM", "RESOURCE GROUP", "NIC", "LAYER", "NSG"] + RULE_HEADERS)
+        writer.writerow(["VM", "RESOURCE GROUP", "NIC", "PUBLIC IP", "LAYER", "NSG"] + RULE_HEADERS)
         for vm in objects:
             for nic in vm["nics"]:
                 if "effective_error" in nic:
                     note(f"{vm['name']}/{nic['name']}: {nic['effective_error']}")
                 for r in effective_rows(nic.get("effective", []), args):
                     writer.writerow(
-                        [vm["name"], vm["resource_group"], nic["name"], r["layer"], r["nsg"]]
+                        [vm["name"], vm["resource_group"], nic["name"],
+                         " ".join(nic["public_ips"]), r["layer"], r["nsg"]]
                         + rule_row(r["rule"])
                     )
         return

@@ -292,11 +292,21 @@ class AzureResourceIngestor:
 
     @staticmethod
     def _public_ip_of(reference: Any, public_ips: Dict[str, Dict[str, Any]]):
-        """Resolve a public IP reference to its address, if it has one yet."""
+        """Resolve a public IP reference to its address, or say why there isn't one.
+
+        Returns None only when nothing is attached. A dynamic public IP has no
+        address while its VM is deallocated, but it is still attached and will
+        face the internet again on start — so it reads ``(unassigned)`` rather
+        than vanishing from the diagram and from ``--public-ip``. A reference
+        to a public IP this scan didn't list (another subscription, or no read
+        access) reads ``(unknown)``.
+        """
         if not reference or not getattr(reference, "id", None):
             return None
         entry = public_ips.get(reference.id.lower())
-        return entry.get("ip_address") if entry else None
+        if not entry:
+            return "(unknown)"
+        return entry.get("ip_address") or "(unassigned)"
 
     def get_nics_and_vms(
         self,
