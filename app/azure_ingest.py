@@ -515,6 +515,108 @@ class AzureResourceIngestor:
         logger.info(f"Found {len(groups)} NSGs")
         return groups
 
+    def get_vm_power_states(self, subscription_id: str) -> Dict[str, str]:
+        """Map each VM ID (lowercased) to its power state: running, deallocated...
+
+        ``status_only`` returns just the instance view for every VM in one
+        paginated call, rather than a GET with ``$expand`` per VM.
+        """
+        compute_client = ComputeManagementClient(
+            self.credential, subscription_id
+        )
+        states = {}
+        for vm in compute_client.virtual_machines.list_all(status_only="true"):
+            statuses = vm.instance_view.statuses if vm.instance_view else None
+            states[vm.id.lower()] = next(
+                (
+                    s.code.split("/", 1)[1]
+                    for s in statuses or []
+                    if s.code and s.code.startswith("PowerState/")
+                ),
+                "unknown",
+            )
+        return states
+
+    def _effective_rule_dict(self, rule: Any) -> Dict[str, Any]:
+        """Flatten one Azure-computed effective rule into the ``_rule_dict`` shape.
+
+        Effective rules are named ``securityRules/<name>`` or
+        ``defaultSecurityRules/<name>``, say ``All`` where an NSG says ``*``,
+        and carry service tags already expanded to address prefixes.
+        """
+        kind, _, name = (rule.name or "").rpartition("/")
+        protocol = self._enum_name(rule.protocol)
+
+        def side(single: Any, many: Any) -> List[str]:
+            return list(many) if many else ([single] if single else [])
+
+        return {
+            "name": name,
+            "priority": rule.priority,
+            "direction": self._enum_name(rule.direction),
+            "access": self._enum_name(rule.access),
+            "protocol": "*" if protocol.lower() == "all" else protocol,
+            "source": side(rule.source_address_prefix, rule.source_address_prefixes),
+            "source_ports": side(rule.source_port_range, rule.source_port_ranges),
+            "destination": side(
+                rule.destination_address_prefix, rule.destination_address_prefixes
+            ),
+            "destination_ports": side(
+                rule.destination_port_range, rule.destination_port_ranges
+            ),
+            "expanded_source": list(rule.expanded_source_address_prefix or []),
+            "expanded_destination": list(
+                rule.expanded_destination_address_prefix or []
+            ),
+            "default": kind == "defaultSecurityRules",
+        }
+
+    def get_effective_security_groups(
+        self, subscription_id: str, nic_id: str
+    ) -> List[Dict[str, Any]]:
+        """Ask Azure which NSG rules actually apply to one NIC.
+
+        This is the portal's "Effective security rules" view: every NSG in
+        force on the NIC — its own and its subnet's — with the rules Azure is
+        enforcing. It's a long-running operation that only succeeds while the
+        NIC's VM is running, and it needs
+        Microsoft.Network/networkInterfaces/effectiveNetworkSecurityGroups/action,
+        which Reader doesn't grant. Failures raise HttpResponseError for the
+        caller to report per NIC.
+        """
+        network_client = NetworkManagementClient(
+            self.credential, subscription_id
+        )
+        parts = nic_id.split("/")
+        # Azure suggests a long Retry-After; the answer is usually ready in a
+        # second or two.
+        poller = network_client.network_interfaces.begin_list_effective_network_security_groups(
+            parts[4], parts[-1], polling_interval=2
+        )
+
+        groups = []
+        for group in poller.result().value or []:
+            association = group.association
+            if association and association.subnet:
+                layer, attached = "subnet", association.subnet.id
+            elif association and association.network_interface:
+                layer, attached = "nic", association.network_interface.id
+            else:
+                layer, attached = "network manager", None
+            nsg_ref = group.network_security_group
+            nsg_id = nsg_ref.id if nsg_ref and nsg_ref.id else ""
+            groups.append({
+                "layer": layer,
+                "attached_to_id": attached.lower() if attached else None,
+                "name": nsg_id.split("/")[-1] if nsg_id else "",
+                "id": nsg_id,
+                "rules": [
+                    self._effective_rule_dict(rule)
+                    for rule in group.effective_security_rules or []
+                ],
+            })
+        return groups
+
     def scan_subscription(self, subscription_id: str) -> Dict[str, Any]:
         """Perform a full scan: VNets, subnets, peerings, NICs, VMs, and LBs."""
         public_ips = self.get_public_ips(subscription_id)

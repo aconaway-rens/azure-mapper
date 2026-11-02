@@ -23,9 +23,10 @@ import ipaddress
 import json
 import logging
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional
 
-from azure.core.exceptions import AzureError, ClientAuthenticationError
+from azure.core.exceptions import AzureError, ClientAuthenticationError, HttpResponseError
 
 from azure_ingest import AzureResourceIngestor
 
@@ -160,6 +161,7 @@ def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any
         "vms": sorted(vms, key=by_name),
         "nics": sorted(nics.values(), key=by_name),
         "nsgs": sorted(nsgs, key=by_name),
+        "subnet_names": subnet_names,
     }
 
 
@@ -322,7 +324,10 @@ def rule_matches(rule: Dict[str, Any], args) -> bool:
         return False
     if args.port is not None and not port_matches(rule["destination_ports"], args.port):
         return False
-    if args.source and not source_matches(rule["source"], args.source):
+    # Effective rules also carry service tags expanded to prefixes, so an
+    # address can match VirtualNetwork or AzureLoadBalancer by what they hold.
+    sources = rule["source"] + rule.get("expanded_source", [])
+    if args.source and not source_matches(sources, args.source):
         return False
     return True
 
@@ -334,7 +339,7 @@ def shown_rules(nsg: Dict[str, Any], args) -> List[Dict[str, Any]]:
 
 # --------------------------------------------------------------- filters ---
 
-def keep(obj: Dict[str, Any], args, kind: str) -> bool:
+def keep(obj: Dict[str, Any], args, kind: str, rules_as_written: bool = True) -> bool:
     if args.rg_patterns is not None and not matches_any(obj["resource_group"], args.rg_patterns):
         return False
     if args.name and not matches_any(obj["name"], args.name):
@@ -359,7 +364,7 @@ def keep(obj: Dict[str, Any], args, kind: str) -> bool:
             return False
         if args.public_ip and not public:
             return False
-        if rule_filter_active(args) and not any(
+        if rules_as_written and rule_filter_active(args) and not any(
             shown_rules(layer["nsg"], args) for layer in obj["layers"]
         ):
             return False
@@ -388,6 +393,89 @@ def keep(obj: Dict[str, Any], args, kind: str) -> bool:
             return False
 
     return True
+
+
+# ------------------------------------------------------ effective rules ---
+
+# Azure evaluates inbound traffic network manager -> subnet -> NIC, and
+# outbound NIC -> subnet; listing rules in that order reads like the path.
+LAYER_ORDER = {
+    "Inbound": {"network manager": 0, "subnet": 1, "nic": 2},
+    "Outbound": {"network manager": 0, "nic": 1, "subnet": 2},
+}
+
+
+def effective_error(error: HttpResponseError) -> str:
+    code = getattr(getattr(error, "error", None), "code", None) or ""
+    if code == "NicMustBeAttachedToRunningVmToGetEffectiveSecurityGroups":
+        return "VM is not running"
+    if code in ("AuthorizationFailed", "LinkedAuthorizationFailed"):
+        return (
+            "this identity lacks Microsoft.Network/networkInterfaces/"
+            "effectiveNetworkSecurityGroups/action (Reader doesn't include it)"
+        )
+    return (getattr(error, "message", None) or str(error)).splitlines()[0]
+
+
+def fetch_effective(
+    ingestor: AzureResourceIngestor,
+    subscription_id: str,
+    vms: List[Dict[str, Any]],
+    subnet_names: Dict[str, str],
+) -> None:
+    """Attach Azure's effective NSG rules to every NIC of every VM given.
+
+    Stopped VMs are skipped without a call — Azure refuses them anyway. The
+    rest run in parallel, since each is a long-running operation of a few
+    seconds. Each NIC gets ``effective`` (a list) or ``effective_error``.
+    """
+    states = ingestor.get_vm_power_states(subscription_id)
+    jobs = []
+    for vm in vms:
+        vm["power_state"] = states.get(vm["id"].lower(), "unknown")
+        for nic in vm["nics"]:
+            if vm["power_state"] == "running":
+                jobs.append(nic)
+            else:
+                nic["effective_error"] = f"VM is {vm['power_state']}"
+
+    if jobs:
+        note(f"Asking Azure for effective rules on {len(jobs)} NIC(s)...")
+
+    def one(nic: Dict[str, Any]) -> None:
+        try:
+            groups = ingestor.get_effective_security_groups(subscription_id, nic["id"])
+        except HttpResponseError as e:
+            nic["effective_error"] = effective_error(e)
+            return
+        for group in groups:
+            attached = group.pop("attached_to_id")
+            group["attached_to"] = (
+                subnet_names.get(attached, attached) if group["layer"] == "subnet"
+                else nic["name"] if group["layer"] == "nic" else ""
+            )
+        nic["effective"] = groups
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(one, jobs))
+
+
+def effective_rows(groups: List[Dict[str, Any]], args) -> List[Dict[str, Any]]:
+    """Every shown rule across a NIC's NSGs, tagged with its NSG, in evaluation order."""
+    rows = [
+        {"layer": group["layer"], "nsg": group["name"], "rule": rule}
+        for group in groups
+        for rule in shown_rules(group, args)
+    ]
+    return sorted(rows, key=lambda r: (
+        r["rule"]["direction"],
+        LAYER_ORDER.get(r["rule"]["direction"], {}).get(r["layer"], 9),
+        r["rule"]["priority"],
+    ))
+
+
+def effective_match(vm: Dict[str, Any], args) -> bool:
+    return any(effective_rows(nic.get("effective", []), args) for nic in vm["nics"])
 
 
 # ---------------------------------------------------------------- output ---
@@ -479,7 +567,52 @@ def print_rules(nsg: Dict[str, Any], args, indent: str) -> None:
         print(f"{indent}(no custom rules; --defaults shows Azure's built-in ones)")
 
 
+def render_effective_table(vms: List[Dict[str, Any]], args) -> None:
+    cap = None if args.full else CELL_WIDTH
+    for i, vm in enumerate(vms):
+        if i:
+            print()
+        ips = " ".join(ip for n in vm["nics"] for ip in n["private_ips"])
+        print(f"{vm['name']}  ({vm['resource_group']})  {ips}  [{vm['power_state']}]")
+        for nic in vm["nics"]:
+            print(f"  NIC {nic['name']}  on {' '.join(nic['subnets'])}")
+            if "effective_error" in nic:
+                # Fall back to the NSGs' own rules, so a stopped VM still
+                # answers the question -- labelled, since Azure didn't vouch
+                # for them.
+                print(f"    effective rules unavailable: {nic['effective_error']}")
+                if not nic["layers"]:
+                    print("    no NSG on the NIC or its subnet")
+                    continue
+                print(f"    rules as written instead: {nsg_cell(nic['layers'])}")
+                groups = [
+                    {"layer": l["layer"], "name": l["nsg"]["name"], "rules": l["nsg"]["rules"]}
+                    for l in nic["layers"]
+                ]
+            elif not nic["effective"]:
+                print("    no NSG applies: nothing filters this NIC's traffic")
+                continue
+            else:
+                groups = nic["effective"]
+                layers = ", ".join(f"{g['name']} ({g['layer']})" for g in groups)
+                print(f"    in force: {layers}")
+            rows = effective_rows(groups, args)
+            if rows:
+                print_table(
+                    ["LAYER", "NSG"] + RULE_HEADERS,
+                    [[r["layer"], r["nsg"]] + rule_row(r["rule"], cap) for r in rows],
+                    "    ",
+                )
+            elif rule_filter_active(args):
+                print("    (no matching rules)")
+            else:
+                print("    (only Azure's default rules; --defaults shows them)")
+
+
 def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
+    if args.effective:
+        render_effective_table(objects, args)
+        return
     if kind == "nsgs":
         for i, nsg in enumerate(objects):
             if i:
@@ -548,8 +681,36 @@ def nic_json(nic: Dict[str, Any], args) -> Dict[str, Any]:
     }
 
 
+def effective_json(nic: Dict[str, Any], args) -> Dict[str, Any]:
+    entry = {k: v for k, v in nic_json(nic, args).items() if k not in ("vm", "nsgs")}
+    if "effective_error" in nic:
+        entry["effective_error"] = nic["effective_error"]
+    else:
+        entry["effective"] = [
+            {
+                "layer": g["layer"],
+                "attached_to": g["attached_to"],
+                "name": g["name"],
+                "id": g["id"],
+                "rules": shown_rules(g, args),
+            }
+            for g in nic["effective"]
+        ]
+    return entry
+
+
 def render_json(objects: List[Dict[str, Any]], args, kind: str) -> None:
-    if kind == "nsgs":
+    if args.effective:
+        data = [{
+            "name": vm["name"],
+            "id": vm["id"],
+            "resource_group": vm["resource_group"],
+            "vm_size": vm["vm_size"],
+            "os_type": vm["os_type"],
+            "power_state": vm["power_state"],
+            "nics": [effective_json(n, args) for n in vm["nics"]],
+        } for vm in objects]
+    elif kind == "nsgs":
         data = [nsg_json(n, args) for n in objects]
     elif kind == "nics":
         data = [nic_json(n, args) for n in objects]
@@ -573,6 +734,18 @@ def render_json(objects: List[Dict[str, Any]], args, kind: str) -> None:
 def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
     """One row per object, or with rules in play, one row per rule."""
     writer = csv.writer(sys.stdout)
+    if args.effective:
+        writer.writerow(["VM", "RESOURCE GROUP", "NIC", "LAYER", "NSG"] + RULE_HEADERS)
+        for vm in objects:
+            for nic in vm["nics"]:
+                if "effective_error" in nic:
+                    note(f"{vm['name']}/{nic['name']}: {nic['effective_error']}")
+                for r in effective_rows(nic.get("effective", []), args):
+                    writer.writerow(
+                        [vm["name"], vm["resource_group"], nic["name"], r["layer"], r["nsg"]]
+                        + rule_row(r["rule"])
+                    )
+        return
     if kind == "nsgs":
         writer.writerow(["NSG", "RESOURCE GROUP"] + RULE_HEADERS)
         for nsg in objects:
@@ -645,6 +818,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     vms = commands.add_parser("vms", parents=[common], help="virtual machines")
     vms.add_argument("--os", type=str.lower, choices=["linux", "windows"])
+    vms.add_argument(
+        "--effective", action="store_true",
+        help="ask Azure for the rules actually in force on each NIC (subnet + NIC "
+             "NSGs, as the portal's Effective security rules shows); running VMs "
+             "only, a few seconds per NIC, and needs more than Reader",
+    )
 
     nics = commands.add_parser("nics", parents=[common], help="network interfaces")
     nics.add_argument("--vm", action="append", metavar="GLOB", help="attached VM name")
@@ -691,7 +870,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         note(f"Next time, skip the questions with: --sub '{sub['name']}' {rgs}")
     note()
 
-    selected = [o for o in objects if keep(o, args, kind)]
+    args.effective = getattr(args, "effective", False)
+    selected = [o for o in objects if keep(o, args, kind, not args.effective)]
+    if args.effective:
+        fetch_effective(ingestor, sub["id"], selected, inventory["subnet_names"])
+        if rule_filter_active(args):
+            unknown = [v["name"] for v in selected if any("effective_error" in n for n in v["nics"])]
+            selected = [v for v in selected if effective_match(v, args)]
+            if unknown:
+                note(f"Couldn't check {len(unknown)} VM(s) without effective rules: {', '.join(unknown)}")
     if args.output == "json":
         render_json(selected, args, kind)
     elif args.output == "csv":

@@ -86,7 +86,7 @@ the rule filters look at both.
 
 | Command | Filters beyond `--name` |
 |---|---|
-| `vms` | `--os`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules` |
+| `vms` | `--os`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules`, `--effective` |
 | `nics` | `--vm`, `--unattached`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules` |
 | `nsgs` | `--vm`, `--subnet`, `--unused` (always lists rules) |
 
@@ -97,6 +97,34 @@ rules. A VM or NIC matches when any rule in either layer does, and only the
 matching rules are printed. Rules are matched **as written**: a match says a
 rule allows the traffic, not that it gets through — a higher-priority deny, or
 the other layer's NSG, can still stop it.
+
+### Effective rules: what Azure actually enforces
+
+```bash
+python app/azmap.py vms --sub Prod --rg '*' --effective
+python app/azmap.py vms --sub Prod --rg '*' --effective --port 22 --from internet
+```
+
+`--effective` asks Azure for each NIC's effective security rules — the portal's
+*Effective security rules* view. Per VM and NIC it shows which NSGs are in
+force and every rule from both layers in one list, in the order Azure evaluates
+them (inbound: subnet, then NIC; outbound: NIC, then subnet), with service tags
+expanded so `--from 10.0.5.5` matches a `VirtualNetwork` rule. Azure's default
+rules are hidden unless `--defaults`.
+
+It lists the rules in force; it doesn't compute a verdict. An allow on the
+subnet followed by a deny on the NIC is shown as both rows — the order tells
+you which wins.
+
+Azure's terms, not ours:
+
+- **Running VMs only.** For a stopped VM it prints the rules as written
+  instead, labelled as such.
+- **One call per NIC**, a few seconds each; they run in parallel.
+- **Needs more than Reader** —
+  `Microsoft.Network/networkInterfaces/effectiveNetworkSecurityGroups/action`,
+  which Network Contributor includes. Without it, each VM says so and the
+  rest of the run carries on.
 
 Output is a table by default; `-o json` keeps rules nested under each object,
 `-o csv` gives one row per rule. Long address lists are shortened in tables
