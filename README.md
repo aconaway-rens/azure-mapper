@@ -59,6 +59,50 @@ else; no topology data leaves the host it runs on.
 - **No outbound internet required** — frontend libraries are vendored, so the app
   works on locked-down hosts that can only reach Azure
 
+## Command-line queries
+
+`app/azmap.py` answers questions about VMs, NICs and NSGs from the terminal,
+using the app's own credential — whatever identity the web app resolves on a
+host, the CLI resolves too. It needs nothing beyond `app/requirements.txt`.
+
+```bash
+python app/azmap.py vms                     # asks for subscription, then resource groups
+python app/azmap.py vms  --sub Prod --rg 'web-*' --no-nsg
+python app/azmap.py nics --sub Prod --rg '*' --unattached
+python app/azmap.py nsgs --sub Prod --rg hub --vm fw01
+python app/azmap.py vms  --sub Prod --rg '*' --port 3389 --from internet --access allow
+```
+
+Scope works in the app's two stages: the subscription is scanned once, then
+resource groups are picked from what the scan found. Leave out `--sub` or
+`--rg` on a terminal and it lists the choices and asks, then prints the flags
+that would skip the questions next time. Piped or scripted, a missing `--rg`
+means every group, and a missing `--sub` is an error unless only one is visible.
+
+Filters: different flags AND together, a repeated flag ORs, and names take
+wildcards, case-insensitively. Each VM and NIC carries both NSG layers — the one
+on the NIC and the one on each subnet it sits in — and `--nsg`, `--no-nsg` and
+the rule filters look at both.
+
+| Command | Filters beyond `--name` |
+|---|---|
+| `vms` | `--os`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules` |
+| `nics` | `--vm`, `--unattached`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules` |
+| `nsgs` | `--vm`, `--subnet`, `--unused` (always lists rules) |
+
+NSG rule filters, on any command: `--port`, `--from` (`internet`, an IP or
+CIDR, or a service tag), `--access allow|deny`, `--proto`, `--direction`
+(inbound by default when filtering), `--defaults` to include Azure's built-in
+rules. A VM or NIC matches when any rule in either layer does, and only the
+matching rules are printed. Rules are matched **as written**: a match says a
+rule allows the traffic, not that it gets through — a higher-priority deny, or
+the other layer's NSG, can still stop it.
+
+Output is a table by default; `-o json` keeps rules nested under each object,
+`-o csv` gives one row per rule. Long address lists are shortened in tables
+(`+13 more`) unless you pass `--full`. Prompts and progress go to stderr, so
+stdout pipes cleanly.
+
 ## Tools
 
 [`tools/Get-AzureNetworkState.ps1`](tools/Get-AzureNetworkState.ps1) prints the
@@ -213,6 +257,7 @@ every source it tried and why each failed. Common causes:
 ├── app/
 │   ├── app.py              # Flask backend
 │   ├── azure_ingest.py     # Azure SDK resource discovery + credential handling
+│   ├── azmap.py            # CLI: query VMs, NICs, NSGs with the same credential
 │   ├── graph_builder.py    # Topology graph model
 │   ├── requirements.txt
 │   ├── static/

@@ -423,6 +423,98 @@ class AzureResourceIngestor:
         logger.info(f"Found {len(balancers)} load balancers")
         return balancers
 
+    @staticmethod
+    def _enum_name(value: Any) -> str:
+        """An SDK enum (or plain string) as its bare value: ``Inbound``, ``Tcp``."""
+        if value is None:
+            return ""
+        return getattr(value, "value", None) or str(value).split(".")[-1]
+
+    @staticmethod
+    def _rule_side(prefix: Any, prefixes: Any, asgs: Any) -> List[str]:
+        """One side of a rule (source or destination) as a list of strings.
+
+        ARM puts a single address in the ``*_prefix`` field and several in
+        ``*_prefixes``, never both; application security groups live in a
+        third field. Flatten all three, naming ASGs ``asg:<name>`` so they
+        can't be mistaken for a service tag.
+        """
+        values = list(prefixes or [])
+        if prefix:
+            values.insert(0, prefix)
+        for asg in asgs or []:
+            if getattr(asg, "id", None):
+                values.append("asg:" + asg.id.split("/")[-1])
+        return values
+
+    def _rule_dict(self, rule: Any, default: bool) -> Dict[str, Any]:
+        """Flatten one security rule into plain values."""
+        return {
+            "name": rule.name,
+            "priority": rule.priority,
+            "direction": self._enum_name(rule.direction),
+            "access": self._enum_name(rule.access),
+            "protocol": self._enum_name(rule.protocol),
+            "source": self._rule_side(
+                rule.source_address_prefix,
+                rule.source_address_prefixes,
+                rule.source_application_security_groups,
+            ),
+            "source_ports": self._rule_side(
+                rule.source_port_range, rule.source_port_ranges, None
+            ),
+            "destination": self._rule_side(
+                rule.destination_address_prefix,
+                rule.destination_address_prefixes,
+                rule.destination_application_security_groups,
+            ),
+            "destination_ports": self._rule_side(
+                rule.destination_port_range, rule.destination_port_ranges, None
+            ),
+            "description": rule.description or "",
+            "default": default,
+        }
+
+    def get_network_security_groups(
+        self, subscription_id: str
+    ) -> List[Dict[str, Any]]:
+        """Fetch every NSG with its rules and what it's attached to.
+
+        Attachments are read from the NSG's side — its own lists of subnet and
+        NIC IDs — rather than from the subnets and NICs, so a lookup by ID
+        never has to guess between two same-named NSGs in different resource
+        groups. IDs are lowercased to match the rest of the scan.
+        """
+        network_client = NetworkManagementClient(
+            self.credential, subscription_id
+        )
+        groups = []
+
+        for nsg in network_client.network_security_groups.list_all():
+            rules = [
+                self._rule_dict(rule, default=False)
+                for rule in nsg.security_rules or []
+            ] + [
+                self._rule_dict(rule, default=True)
+                for rule in nsg.default_security_rules or []
+            ]
+            groups.append({
+                "id": nsg.id,
+                "name": nsg.name,
+                "resource_group": nsg.id.split("/")[4],
+                "location": nsg.location,
+                "subnet_ids": [
+                    s.id.lower() for s in nsg.subnets or [] if s.id
+                ],
+                "nic_ids": [
+                    n.id.lower() for n in nsg.network_interfaces or [] if n.id
+                ],
+                "rules": rules,
+            })
+
+        logger.info(f"Found {len(groups)} NSGs")
+        return groups
+
     def scan_subscription(self, subscription_id: str) -> Dict[str, Any]:
         """Perform a full scan: VNets, subnets, peerings, NICs, VMs, and LBs."""
         public_ips = self.get_public_ips(subscription_id)
