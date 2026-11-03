@@ -90,7 +90,7 @@ the rule filters look at both.
 |---|---|
 | `vms` | `--os`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules`, `--effective` |
 | `nics` | `--vm`, `--unattached`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules` |
-| `nsgs` | `--vm`, `--subnet`, `--unused` (always lists rules) |
+| `nsgs` | `--vm`, `--subnet`, `--unused` |
 
 NSG rule filters, on any command: `--port`, `--from` (`internet`, an IP or
 CIDR, or a service tag), `--access allow|deny`, `--proto`, `--direction`
@@ -128,8 +128,24 @@ Azure's terms, not ours:
   which Network Contributor includes. Without it, each VM says so and the
   rest of the run carries on.
 
-Output is a table by default; `-o json` keeps rules nested under each object,
-`-o csv` gives one row per rule. Long address lists are shortened in tables
+### Every NSG in a subscription
+
+```bash
+python app/azmap.py nsgs --sub Prod --rg '*'                  # readable report
+python app/azmap.py nsgs --sub Prod --rg '*' -o yaml --out nsgs.yaml
+```
+
+Each NSG lists the subnets it's bound to, the interfaces it's bound to (with
+the VM behind each), every VM it covers either way, and its rules as separate
+inbound and outbound tables. Add `--defaults` for Azure's built-in rules, which
+complete the picture: without a custom deny, `DenyAllInBound` is what stops
+everything else.
+
+### Output formats
+
+Output is a table by default. `-o json` and `-o yaml` carry the same data —
+rules nested under each object, and for `nsgs` split into `inbound` and
+`outbound` lists. `-o csv` gives one row per rule. Long address lists are shortened in tables
 (`+13 more`) unless you pass `--full`. Prompts and progress go to stderr, so
 stdout pipes cleanly.
 

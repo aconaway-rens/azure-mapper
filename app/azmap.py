@@ -23,7 +23,9 @@ import fnmatch
 import ipaddress
 import json
 import logging
+import re
 import sys
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -136,7 +138,7 @@ def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any
             layers.append({
                 "layer": "nic", "attached_to": nic["name"], "nsg": nsg_on_nic[key],
             })
-            nsg_on_nic[key]["nics"].append(nic["name"])
+            nsg_on_nic[key]["nics"].append({"name": nic["name"], "vm": nic["vm_name"]})
         nic["layers"] = layers
 
     vms = []
@@ -568,6 +570,43 @@ def print_rules(nsg: Dict[str, Any], args, indent: str) -> None:
         print(f"{indent}(no custom rules; --defaults shows Azure's built-in ones)")
 
 
+def print_list(label: str, values: List[str], indent: str = "  ") -> None:
+    """``label: a, b, c``, wrapped under itself when it runs long."""
+    if not values:
+        return
+    head = f"{indent}{label + ':':<13}"
+    print(textwrap.fill(
+        ", ".join(values), width=100,
+        initial_indent=head, subsequent_indent=" " * len(head),
+        break_long_words=False, break_on_hyphens=False,
+    ))
+
+
+def print_rules_by_direction(nsg: Dict[str, Any], args, indent: str) -> None:
+    """The NSG's rules as an inbound table and an outbound table."""
+    rules = shown_rules(nsg, args)
+    cap = None if args.full else CELL_WIDTH
+    headers = [h for h in RULE_HEADERS if h != "DIR"]
+    for direction in ("Inbound", "Outbound"):
+        # Both headings always print, so an empty direction reads as empty
+        # rather than as forgotten -- unless --direction asked for one side.
+        if args.direction not in ("any", direction[:-5].lower()):
+            continue
+        these = [r for r in rules if r["direction"] == direction]
+        if these:
+            print(f"{indent}{direction.lower()}:")
+            print_table(headers, [
+                [c for h, c in zip(RULE_HEADERS, rule_row(r, cap)) if h != "DIR"]
+                for r in these
+            ], indent + "  ")
+        elif rule_filter_active(args):
+            print(f"{indent}{direction.lower()}: (no matching rules)")
+        elif args.defaults:
+            print(f"{indent}{direction.lower()}: (no rules)")
+        else:
+            print(f"{indent}{direction.lower()}: (no custom rules; --defaults shows Azure's built-in ones)")
+
+
 def render_effective_table(vms: List[Dict[str, Any]], args) -> None:
     cap = None if args.full else CELL_WIDTH
     for i, vm in enumerate(vms):
@@ -620,13 +659,14 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
             if i:
                 print()
             print(f"{nsg['name']}  ({nsg['resource_group']}, {nsg['location']})")
-            attached = [f"subnet {s}" for s in nsg["subnets"]] + [
-                f"nic {n}" for n in nsg["nics"]
-            ]
-            print(f"  attached to: {', '.join(attached) or 'nothing'}")
-            if nsg["vms"]:
-                print(f"  guards VMs:  {', '.join(nsg['vms'])}")
-            print_rules(nsg, args, "  ")
+            if not nsg["subnets"] and not nsg["nics"]:
+                print("  attached to nothing")
+            print_list("subnets", nsg["subnets"])
+            print_list("interfaces", [
+                f"{n['name']} ({n['vm'] or 'unattached'})" for n in nsg["nics"]
+            ])
+            print_list("VMs covered", nsg["vms"])
+            print_rules_by_direction(nsg, args, "  ")
         return
 
     print_table(OBJECT_HEADERS[kind], [object_row(o, kind) for o in objects])
@@ -643,15 +683,26 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
 
 
 def nsg_json(nsg: Dict[str, Any], args) -> Dict[str, Any]:
+    rules = shown_rules(nsg, args)
+
+    def side(direction: str) -> List[Dict[str, Any]]:
+        # The section names the direction; an empty description is noise.
+        return [
+            {k: v for k, v in r.items()
+             if k != "direction" and not (k == "description" and not v)}
+            for r in rules if r["direction"] == direction
+        ]
+
     return {
         "name": nsg["name"],
         "id": nsg["id"],
         "resource_group": nsg["resource_group"],
         "location": nsg["location"],
         "subnets": nsg["subnets"],
-        "nics": nsg["nics"],
+        "interfaces": nsg["nics"],
         "vms": nsg["vms"],
-        "rules": shown_rules(nsg, args),
+        "inbound": side("Inbound"),
+        "outbound": side("Outbound"),
     }
 
 
@@ -701,7 +752,8 @@ def effective_json(nic: Dict[str, Any], args) -> Dict[str, Any]:
     return entry
 
 
-def render_json(objects: List[Dict[str, Any]], args, kind: str) -> None:
+def structured(objects: List[Dict[str, Any]], args, kind: str) -> List[Dict[str, Any]]:
+    """The output as plain data, for JSON and YAML alike."""
     if args.effective:
         data = [{
             "name": vm["name"],
@@ -729,8 +781,88 @@ def render_json(objects: List[Dict[str, Any]], args, kind: str) -> None:
             ],
             "nsgs": layers_json(vm["layers"], args),
         } for vm in objects]
-    json.dump(data, sys.stdout, indent=2)
+    return data
+
+
+def render_json(objects: List[Dict[str, Any]], args, kind: str) -> None:
+    json.dump(structured(objects, args, kind), sys.stdout, indent=2)
     print()
+
+
+# ------------------------------------------------------------------ yaml ---
+#
+# Written by hand rather than with PyYAML: the data is only strings, numbers,
+# booleans, lists and dicts, and a new dependency would mean reinstalling on
+# every host that already runs the app.
+
+# Words YAML 1.1 readers turn into booleans or null if left unquoted.
+YAML_RESERVED = {"", "~", "null", "true", "false", "yes", "no", "on", "off", "y", "n"}
+YAML_PLAIN = re.compile(r"^[A-Za-z0-9_(][A-Za-z0-9_ ./()-]*$")
+YAML_NUMBER = re.compile(r"^[-+]?(\d[\d_]*(\.\d*)?|\.\d+)([eE][-+]?\d+)?$|^0[xXoO]")
+YAML_DATE = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}")
+YAML_FLOW_WIDTH = 80
+
+
+def yaml_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    # The SDK hands back some fields (VM sizes, for one) as str-based enums,
+    # whose str() is "VirtualMachineSizeTypes.STANDARD_B2_MS"; JSON writes the
+    # underlying value, so YAML must too.
+    text = str.__str__(value) if isinstance(value, str) else str(value)
+    if (
+        YAML_PLAIN.match(text) and not text.endswith(" ")
+        and text.lower() not in YAML_RESERVED
+        and not YAML_NUMBER.match(text) and not YAML_DATE.match(text)
+    ):
+        return text
+    # A JSON string is a valid YAML double-quoted scalar, escapes and all.
+    return json.dumps(text, ensure_ascii=False)
+
+
+def yaml_inline(value: Any) -> Optional[str]:
+    """``value`` on one line, or None if it needs a block."""
+    if isinstance(value, dict):
+        return "{}" if not value else None
+    if isinstance(value, list):
+        if any(isinstance(v, (dict, list)) for v in value):
+            return None
+        flow = "[" + ", ".join(yaml_scalar(v) for v in value) + "]"
+        return flow if len(flow) <= YAML_FLOW_WIDTH else None
+    return yaml_scalar(value)
+
+
+def yaml_lines(value: Any, indent: int = 0) -> List[str]:
+    pad = "  " * indent
+    lines: List[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            inline = yaml_inline(item)
+            if inline is not None:
+                lines.append(f"{pad}{yaml_scalar(key)}: {inline}")
+            else:
+                lines.append(f"{pad}{yaml_scalar(key)}:")
+                lines.extend(yaml_lines(item, indent + 1))
+    else:
+        for item in value:
+            inline = yaml_inline(item)
+            if inline is not None:
+                lines.append(f"{pad}- {inline}")
+            else:
+                # The item's block, with its first line moved up beside the dash.
+                block = yaml_lines(item, indent + 1)
+                lines.append(f"{pad}- {block[0].lstrip()}")
+                lines.extend(block[1:])
+    return lines
+
+
+def render_yaml(objects: List[Dict[str, Any]], args, kind: str) -> None:
+    data = structured(objects, args, kind)
+    print("\n".join(yaml_lines(data)) if data else "[]")
 
 
 def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
@@ -808,7 +940,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="include Azure's built-in default rules",
     )
 
-    common.add_argument("-o", "--output", choices=["table", "json", "csv"], default="table")
+    common.add_argument("-o", "--output", choices=["table", "json", "yaml", "csv"], default="table")
     common.add_argument(
         "--out", metavar="FILE",
         help="write the output to FILE instead of the screen; use this rather "
@@ -909,6 +1041,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 def render(selected: List[Dict[str, Any]], args, kind: str) -> None:
     if args.output == "json":
         render_json(selected, args, kind)
+    elif args.output == "yaml":
+        render_yaml(selected, args, kind)
     elif args.output == "csv":
         render_csv(selected, args, kind)
     elif selected:
