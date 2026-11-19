@@ -75,6 +75,8 @@ python app/azmap.py nsgs --sub Prod --rg hub --vm fw01
 python app/azmap.py subnets --sub Prod --rg '*' --routes
 python app/azmap.py vms  --sub Prod --rg '*' --port 3389 --from internet --access allow
 python app/azmap.py vms  --sub '*' --rg '*'    # every VM in every subscription
+python app/azmap.py export --sub '*'           # everything, to one snapshot file
+python app/azmap.py gateways --file azmap-snapshot-20261119-1740.yaml --detail
 ```
 
 Scope works in the app's two stages: the subscription is scanned once, then
@@ -202,10 +204,48 @@ under its own names — the same `properties` that `az network vnet-gateway show
 prints — so nothing is left out for want of a column. Pre-shared keys and
 RADIUS secrets are always removed: they'd otherwise land in files.
 
+Each gateway also carries what its settings only point at: the full
+settings of its public IPs (SKU, tier, allocation, IP version, zones, DNS
+label, idle timeout) and its GatewaySubnet's prefix with the VNet's address
+space, so one record is enough to recreate it.
+
 Reading these takes Reader. The resource types are found through the
 subscription's resource listing, then each is read individually, which is
 what returns a connection's live status; one that can't be read is listed as
 `(unreadable)` with the reason.
+
+### Snapshots: export once, read back offline
+
+```bash
+python app/azmap.py export --sub '*'                                   # azmap-snapshot-YYYYMMDD-HHMM.yaml
+python app/azmap.py export --sub Prod --out prod.yaml
+python app/azmap.py gateways    --file prod.yaml --detail              # no Azure, no login
+python app/azmap.py subnets     --file prod.yaml --rg '*' --routes
+python app/azmap.py connections --file prod.yaml -o csv --out tunnels.csv
+```
+
+`export` saves everything azmap reads — VMs, NICs, public IPs, VNets and
+subnets, NSGs with their rules, route tables, gateways, local gateways and
+connections — for each subscription into one YAML file, with when it was
+taken and by which version. `--file` on any command reads that file instead
+of Azure: the same tables, filters, `--detail` and output formats, with no
+credential needed, so it works when Azure doesn't. It covers every
+subscription in the file unless `--sub` narrows it.
+
+Keep these as the record to rebuild from. Things to know:
+
+- **No secrets.** Pre-shared keys and RADIUS secrets are left out; keep them
+  in a password vault. A tunnel can't be rebuilt without its key.
+- **No effective rules.** `--effective` asks Azure live, so it doesn't work
+  with `--file`; `--rules` shows the rules as written, which is what you'd
+  rebuild anyway.
+- **Diffable.** Gateway settings are written in sorted order, so two
+  snapshots of an unchanged environment diff clean.
+- **Only export files read back.** A file from `-o yaml` is a report shaped
+  for reading, not a snapshot, and `--file` says so.
+- **Plain YAML.** Any YAML reader opens it. azmap reads back the YAML it
+  writes without needing a YAML library; a hand-edited file that breaks the
+  layout is reported with a line number.
 
 ### Output formats
 

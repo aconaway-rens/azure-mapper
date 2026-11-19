@@ -21,20 +21,24 @@ or the other layer's NSG, can still block what a matching rule allows.
 
 import argparse
 import contextlib
+import copy
 import csv
 import fnmatch
 import ipaddress
 import json
 import logging
+import os
 import re
 import sys
 import textwrap
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional
 
 from azure.core.exceptions import AzureError, ClientAuthenticationError, HttpResponseError
 
 from azure_ingest import AzureResourceIngestor
+from version import __version__
 
 # What a rule's source looks like when it admits the whole internet.
 INTERNET_SOURCES = {"*", "any", "internet", "0.0.0.0/0", "::/0"}
@@ -302,11 +306,12 @@ def scan_all(
     reported and left out, so one bad subscription doesn't sink a run over
     all of them. With only one, its failure is the run's.
     """
+    verb = "Reading" if isinstance(ingestor, SnapshotIngestor) else "Scanning"
     if len(subscriptions) == 1:
-        note(f"Scanning {subscriptions[0]['name']}...")
+        note(f"{verb} {subscriptions[0]['name']}...")
         inventories = [scan(ingestor, subscriptions[0], kind)]
     else:
-        note(f"Scanning {len(subscriptions)} subscriptions...")
+        note(f"{verb} {len(subscriptions)} subscriptions...")
 
         def one(sub):
             try:
@@ -354,10 +359,16 @@ def scan_vpn(ingestor: AzureResourceIngestor, subscription: Dict[str, Any]) -> D
     """Gateways, local gateways and connections, with public IPs resolved."""
     subscription_id = subscription["id"]
     public_ips = ingestor.get_public_ips(subscription_id)
+    vnets = ingestor.get_vnets_and_subnets(subscription_id)
     raw = ingestor.get_vpn_inventory(subscription_id)
 
+    # A gateway's settings name its subnet and public IPs only by ID; to
+    # rebuild it you need what's behind them, so carry that on the record.
+    subnets_by_id = {
+        sub["id"].lower(): (vnet, sub) for vnet in vnets.values() for sub in vnet["subnets"]
+    }
     for gw in raw["gateways"]:
-        gw["public_ips"], vnets = [], []
+        gw["public_ips"], gw["gateway_subnets"], names = [], [], []
         for config in gw["properties"].get("ipConfigurations") or []:
             props = config.get("properties") or {}
             pip = ref_id(props.get("publicIPAddress"))
@@ -366,11 +377,26 @@ def scan_vpn(ingestor: AzureResourceIngestor, subscription: Dict[str, Any]) -> D
                 gw["public_ips"].append({
                     "name": entry.get("name") or pip.split("/")[-1],
                     "address": entry.get("ip_address") or ("(unassigned)" if entry else "(unknown)"),
+                    "ip_configuration": config.get("name") or "",
+                    **{k: v for k, v in entry.items() if k not in ("ip_address", "name")},
                 })
-            subnet = (props.get("subnet") or {}).get("id")
-            if subnet and len(subnet.split("/")) > 8 and subnet.split("/")[8] not in vnets:
-                vnets.append(subnet.split("/")[8])
-        gw["vnet"] = ", ".join(vnets)
+            subnet_id = ref_id(props.get("subnet"))
+            if subnet_id and subnet_id in subnets_by_id:
+                vnet, sub = subnets_by_id[subnet_id]
+                if vnet["name"] not in names:
+                    names.append(vnet["name"])
+                    gw["gateway_subnets"].append({
+                        "vnet": vnet["name"],
+                        "vnet_resource_group": vnet["resource_group"],
+                        "vnet_address_space": vnet["address_prefixes"],
+                        "subnet": sub["name"],
+                        "subnet_prefixes": sub["address_prefixes"],
+                    })
+            elif subnet_id and len(subnet_id.split("/")) > 8:
+                name = subnet_id.split("/")[8]
+                if name not in names:
+                    names.append(name)
+        gw["vnet"] = ", ".join(names)
 
     inventory = {
         "gateways": raw["gateways"],
@@ -507,6 +533,7 @@ def vpn_json(obj: Dict[str, Any]) -> Dict[str, Any]:
     }
     if "public_ips" in obj:
         entry["vnet"] = obj["vnet"]
+        entry["gateway_subnets"] = obj.get("gateway_subnets", [])
         entry["public_ips"] = obj["public_ips"]
     if "gateway" in obj:
         entry["gateway"] = obj["gateway"]
@@ -1368,6 +1395,145 @@ def render_yaml(objects: List[Dict[str, Any]], args, kind: str) -> None:
     print("\n".join(yaml_lines(data)) if data else "[]")
 
 
+# The reader below parses what yaml_lines writes, and only that: block maps
+# and lists two spaces deep, flow lists of scalars, and scalars that are
+# either plain or a JSON string. That's enough to read snapshots back without
+# a YAML library; a hand-edited file that strays outside it gets a line
+# number. Plain text is typed the way yaml_scalar decided to leave it plain:
+# anything that would read as a number, boolean or null was quoted.
+
+class YamlError(ValueError):
+    pass
+
+
+def _yaml_value(text: str, line: int) -> Any:
+    if text.startswith('"'):
+        try:
+            value, end = json.JSONDecoder().raw_decode(text)
+        except ValueError:
+            raise YamlError(f"line {line}: bad quoted string")
+        if text[end:].strip():
+            raise YamlError(f"line {line}: unexpected text after a string")
+        return value
+    if text == "{}":
+        return {}
+    if text.startswith("["):
+        return _yaml_flow(text, line)
+    if text == "null" or text == "~":
+        return None
+    if text in ("true", "false"):
+        return text == "true"
+    if YAML_NUMBER.match(text):
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                return text
+    return text
+
+
+def _yaml_flow(text: str, line: int) -> List[Any]:
+    if not text.endswith("]"):
+        raise YamlError(f"line {line}: unclosed list")
+    body, items, i = text[1:-1], [], 0
+    while i < len(body):
+        while i < len(body) and body[i] == " ":
+            i += 1
+        if i >= len(body):
+            break
+        if body[i] == '"':
+            try:
+                value, end = json.JSONDecoder().raw_decode(body, i)
+            except ValueError:
+                raise YamlError(f"line {line}: bad quoted string in list")
+            items.append(value)
+            i = end
+        else:
+            end = body.find(",", i)
+            end = len(body) if end < 0 else end
+            items.append(_yaml_value(body[i:end].strip(), line))
+            i = end
+        while i < len(body) and body[i] == " ":
+            i += 1
+        if i < len(body):
+            if body[i] != ",":
+                raise YamlError(f"line {line}: expected ',' in list")
+            i += 1
+    return items
+
+
+def _yaml_key(text: str, line: int):
+    """Split ``key: rest`` into (key, rest), or None if it isn't a map entry."""
+    if text.startswith('"'):
+        try:
+            key, end = json.JSONDecoder().raw_decode(text)
+        except ValueError:
+            return None
+        rest = text[end:]
+    else:
+        colon = text.find(":")
+        if colon < 0:
+            return None
+        key, rest = text[:colon], text[colon:]
+        # yaml_scalar leaves a key unquoted only when it's plain; anything
+        # else with a colon in it (a flow list holding "k: v") is a value.
+        if not YAML_PLAIN.match(key):
+            return None
+    if rest == ":":
+        return key, ""
+    if rest.startswith(": "):
+        return key, rest[2:]
+    return None
+
+
+def yaml_load(text: str) -> Any:
+    lines = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip() or raw.startswith("#"):
+            continue
+        stripped = raw.lstrip(" ")
+        lines.append([len(raw) - len(stripped), stripped.rstrip(), number])
+    if not lines:
+        return None
+    if len(lines) == 1 and lines[0][0] == 0 and _yaml_key(lines[0][1], 1) is None \
+            and not lines[0][1].startswith("- "):
+        return _yaml_value(lines[0][1], lines[0][2])
+
+    def block(i: int, indent: int):
+        if lines[i][1].startswith("- "):
+            out: List[Any] = []
+            while i < len(lines) and lines[i][0] == indent and lines[i][1].startswith("- "):
+                rest = lines[i][1][2:]
+                if rest.startswith("- ") or _yaml_key(rest, lines[i][2]) is not None:
+                    # The item's own block, its first line pulled up beside the dash.
+                    lines[i] = [indent + 2, rest, lines[i][2]]
+                    value, i = block(i, indent + 2)
+                else:
+                    value, i = _yaml_value(rest, lines[i][2]), i + 1
+                out.append(value)
+            return out, i
+        mapping: Dict[str, Any] = {}
+        while i < len(lines) and lines[i][0] == indent and not lines[i][1].startswith("- "):
+            entry = _yaml_key(lines[i][1], lines[i][2])
+            if entry is None:
+                raise YamlError(f"line {lines[i][2]}: expected 'key: value'")
+            key, rest = entry
+            if rest:
+                mapping[key], i = _yaml_value(rest, lines[i][2]), i + 1
+            else:
+                if i + 1 >= len(lines) or lines[i + 1][0] <= indent:
+                    raise YamlError(f"line {lines[i][2]}: '{key}:' has nothing under it")
+                mapping[key], i = block(i + 1, lines[i + 1][0])
+        return mapping, i
+
+    value, i = block(0, lines[0][0])
+    if i < len(lines):
+        raise YamlError(f"line {lines[i][2]}: indentation doesn't match the lines above")
+    return value
+
+
 def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
     """One row per object, or with rules in play, one row per rule."""
     writer = csv.writer(sys.stdout)
@@ -1427,6 +1593,135 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
                           layer["layer"], layer["nsg"]["name"]] + rule_row(rule))
 
 
+# -------------------------------------------------------------- snapshot ---
+#
+# `azmap export` records what each Azure call returned, per subscription;
+# --file plays it back through SnapshotIngestor, so every command, filter and
+# output format reads a snapshot exactly as it reads Azure.
+
+SNAPSHOT_FORMAT = 1
+
+
+def snapshot_subscription(ingestor: AzureResourceIngestor, sub: Dict[str, Any]) -> Dict[str, Any]:
+    sub_id = sub["id"]
+    public_ips = ingestor.get_public_ips(sub_id)
+    return {
+        "id": sub_id,
+        "name": sub["name"],
+        "state": str(sub["state"]).split(".")[-1].capitalize(),
+        "public_ips": public_ips,
+        "compute": ingestor.get_nics_and_vms(sub_id, public_ips),
+        "vnets": ingestor.get_vnets_and_subnets(sub_id),
+        "nsgs": ingestor.get_network_security_groups(sub_id),
+        "route_tables": ingestor.get_route_tables(sub_id),
+        "vpn": ingestor.get_vpn_inventory(sub_id),
+    }
+
+
+class SnapshotIngestor:
+    """Answers the CLI's Azure calls from an ``azmap export`` file."""
+
+    def __init__(self, path: str):
+        try:
+            with open(path, encoding="utf-8-sig") as handle:
+                text = handle.read()
+        except OSError as e:
+            raise SystemExit(f"Can't read {path}: {e.strerror or e}")
+        try:
+            data = json.loads(text) if text.lstrip().startswith("{") else yaml_load(text)
+        except (YamlError, ValueError) as e:
+            raise SystemExit(f"{path} isn't a readable snapshot: {e}")
+        if not isinstance(data, dict) or "azmap_snapshot" not in data:
+            raise SystemExit(
+                f"{path} isn't an azmap snapshot. Make one with: azmap export --sub '*'\n"
+                f"(a file from -o yaml is a report; it can't be read back.)"
+            )
+        self.taken = data.get("taken", "?")
+        self.version = data.get("azmap_version", "?")
+        self.subs = {s["id"]: s for s in data.get("subscriptions") or []}
+
+    def _part(self, sub_id: str, key: str, empty: Any) -> Any:
+        # Deep-copied: scan() annotates what it's given, and a snapshot from
+        # an older azmap may lack a part a newer one records.
+        return copy.deepcopy(self.subs[sub_id].get(key, empty))
+
+    def get_subscriptions(self):
+        return [{"id": s["id"], "name": s["name"], "state": s.get("state", "Enabled")}
+                for s in self.subs.values()]
+
+    def get_public_ips(self, sub_id):
+        return self._part(sub_id, "public_ips", {})
+
+    def get_nics_and_vms(self, sub_id, public_ips=None):
+        return self._part(sub_id, "compute", {"nics": [], "vms": {}})
+
+    def get_vnets_and_subnets(self, sub_id):
+        return self._part(sub_id, "vnets", {})
+
+    def get_network_security_groups(self, sub_id):
+        return self._part(sub_id, "nsgs", [])
+
+    def get_route_tables(self, sub_id):
+        return self._part(sub_id, "route_tables", {})
+
+    def get_vpn_inventory(self, sub_id):
+        return self._part(sub_id, "vpn", {"gateways": [], "local_gateways": [], "connections": []})
+
+
+def run_export(args) -> int:
+    path = args.out or datetime.now().strftime("azmap-snapshot-%Y%m%d-%H%M.yaml")
+    try:
+        open(path, "a").close()
+    except OSError as e:
+        raise SystemExit(out_error(path, e))
+
+    live = AzureResourceIngestor()
+    subs = choose_subscriptions(live, args.sub)
+    note(f"Exporting {len(subs)} subscription(s)...")
+
+    def one(sub):
+        try:
+            return snapshot_subscription(live, sub)
+        except HttpResponseError as e:
+            note(f"  Skipped {sub['name']}: {(e.message or str(e)).splitlines()[0]}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        recorded = [r for r in pool.map(one, subs) if r]
+    if not recorded:
+        raise SystemExit("Every subscription failed to export; nothing written.")
+
+    snapshot = {
+        "azmap_snapshot": SNAPSHOT_FORMAT,
+        "taken": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "azmap_version": __version__,
+        "subscriptions": recorded,
+    }
+    header = [
+        f"# azmap snapshot of {len(recorded)} subscription(s), taken {snapshot['taken']}.",
+        "# Read it back with any command plus --file, e.g.:",
+        f"#   azmap gateways --file {os.path.basename(path)} --detail",
+        f"#   azmap subnets  --file {os.path.basename(path)} --routes",
+        "# Pre-shared keys and RADIUS secrets are not included.",
+    ]
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("\n".join(header + yaml_lines(snapshot)) + "\n")
+    except OSError as e:
+        raise SystemExit(out_error(path, e))
+
+    counts = {
+        "VMs": sum(len(r["compute"]["vms"]) for r in recorded),
+        "NSGs": sum(len(r["nsgs"]) for r in recorded),
+        "subnets": sum(len(v["subnets"]) for r in recorded for v in r["vnets"].values()),
+        "gateways": sum(len(r["vpn"]["gateways"]) for r in recorded),
+        "local gateways": sum(len(r["vpn"]["local_gateways"]) for r in recorded),
+        "connections": sum(len(r["vpn"]["connections"]) for r in recorded),
+    }
+    note(f"Wrote {path}: " + ", ".join(f"{n} {k}" for k, n in counts.items()))
+    return 0
+
+
 # ------------------------------------------------------------------ main ---
 
 NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs", "subnets": "subnets",
@@ -1476,6 +1771,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     common.add_argument("--full", action="store_true",
                         help="don't shorten long address and port lists in tables")
+    common.add_argument(
+        "--file", metavar="SNAPSHOT",
+        help="read an 'azmap export' snapshot instead of Azure; no login needed, "
+             "and every subscription in it unless --sub narrows it",
+    )
 
     parser = argparse.ArgumentParser(
         prog="azmap",
@@ -1544,6 +1844,16 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--detail", action="store_true",
                          help="every setting of each, below the table (as -o yaml has)")
 
+    export = commands.add_parser(
+        "export", help="save everything to one YAML snapshot, readable later with --file",
+    )
+    export.add_argument(
+        "--sub", metavar="SUB", action="append",
+        help="subscription name or ID; repeatable, wildcards allowed, '*' for all",
+    )
+    export.add_argument("--out", metavar="FILE",
+                        help="default: azmap-snapshot-YYYYMMDD-HHMM.yaml here")
+
     for sub in (vms, nics, nsgs):
         sub.add_argument("--subnet", action="append", metavar="GLOB",
                          help="subnet, as NAME or VNET/NAME")
@@ -1554,6 +1864,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     kind = args.command
+    if kind == "export":
+        logging.basicConfig(level=logging.WARNING)
+        return run_export(args)
+    if args.file and getattr(args, "effective", False):
+        parser.error("--effective asks Azure for live rules; a snapshot holds the "
+                     "rules as written, which --rules shows")
     if args.direction is None:
         args.direction = "in" if rule_filter_active(args) else "any"
     # A rule filter on VMs or NICs is a question about rules; show the answer.
@@ -1573,8 +1889,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         except OSError as e:
             raise SystemExit(out_error(args.out, e))
 
-    ingestor = AzureResourceIngestor()
-    subs = choose_subscriptions(ingestor, args.sub)
+    if args.file:
+        ingestor = SnapshotIngestor(args.file)
+        note(f"Snapshot {args.file}: taken {ingestor.taken} by azmap {ingestor.version}")
+        subs = (choose_subscriptions(ingestor, args.sub) if args.sub
+                else ingestor.get_subscriptions())
+    else:
+        ingestor = AzureResourceIngestor()
+        subs = choose_subscriptions(ingestor, args.sub)
     args.multi_sub = len(subs) > 1
     args.detail = getattr(args, "detail", False)
     inventory = scan_all(ingestor, subs, kind)

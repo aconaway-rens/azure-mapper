@@ -49,8 +49,13 @@ SECRET_KEY = re.compile(r"sharedkey|secret|password", re.IGNORECASE)
 
 
 def _without_secrets(value: Any) -> Any:
+    """``value`` with secrets dropped and keys sorted.
+
+    Sorted so two snapshots of an unchanged gateway diff clean: the SDK's
+    key order isn't guaranteed to hold from one run to the next.
+    """
     if isinstance(value, dict):
-        return {k: _without_secrets(v) for k, v in value.items() if not SECRET_KEY.search(k)}
+        return {k: _without_secrets(value[k]) for k in sorted(value) if not SECRET_KEY.search(k)}
     if isinstance(value, list):
         return [_without_secrets(v) for v in value]
     return value
@@ -313,11 +318,23 @@ class AzureResourceIngestor:
 
         for pip in network_client.public_ip_addresses.list_all():
             dns = getattr(pip, "dns_settings", None)
+            sku = getattr(pip, "sku", None)
             public_ips[pip.id.lower()] = {
                 "id": pip.id,
                 "name": pip.name,
                 "ip_address": pip.ip_address,
                 "fqdn": getattr(dns, "fqdn", None) if dns else None,
+                # What it takes to recreate the address resource, which a
+                # gateway's own settings only reference by ID.
+                "resource_group": pip.id.split("/")[4],
+                "location": pip.location,
+                "sku": self._enum_name(getattr(sku, "name", None)) if sku else "",
+                "tier": self._enum_name(getattr(sku, "tier", None)) if sku else "",
+                "allocation": self._enum_name(pip.public_ip_allocation_method),
+                "ip_version": self._enum_name(pip.public_ip_address_version),
+                "zones": list(pip.zones or []),
+                "dns_label": getattr(dns, "domain_name_label", None) if dns else None,
+                "idle_timeout_minutes": pip.idle_timeout_in_minutes,
             }
 
         logger.info(f"Found {len(public_ips)} public IPs")
