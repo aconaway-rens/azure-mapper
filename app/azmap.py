@@ -1296,6 +1296,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     logging.basicConfig(level=logging.WARNING)
 
+    if args.out:
+        # Check the file can be written before a scan that may take minutes.
+        # Append mode creates it if need be and leaves an existing one intact.
+        try:
+            open(args.out, "a").close()
+        except OSError as e:
+            raise SystemExit(out_error(args.out, e))
+
     ingestor = AzureResourceIngestor()
     subs = choose_subscriptions(ingestor, args.sub)
     args.multi_sub = len(subs) > 1
@@ -1329,9 +1337,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         # lands in column A. UTF-8 with a BOM is what Excel recognises, and
         # newline="" leaves the csv module's \r\n alone instead of doubling it.
         encoding = "utf-8-sig" if args.output == "csv" else "utf-8"
-        with open(args.out, "w", encoding=encoding, newline="") as handle, \
-                contextlib.redirect_stdout(handle):
-            render(selected, args, kind)
+        try:
+            with open(args.out, "w", encoding=encoding, newline="") as handle, \
+                    contextlib.redirect_stdout(handle):
+                render(selected, args, kind)
+        except OSError as e:
+            raise SystemExit(out_error(args.out, e))
         note(f"Wrote {len(selected)} {NOUNS[kind]} to {args.out}")
     else:
         if args.output == "csv":
@@ -1340,6 +1351,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             sys.stdout.reconfigure(newline="")
         render(selected, args, kind)
     return 0
+
+
+def out_error(path: str, error: OSError) -> str:
+    if isinstance(error, PermissionError):
+        return (f"Can't write {path}: it's open in another program (Excel locks "
+                f"files it has open) or the folder is read-only. Close it and rerun.")
+    return f"Can't write {path}: {error.strerror or error}"
 
 
 def render(selected: List[Dict[str, Any]], args, kind: str) -> None:
