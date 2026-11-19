@@ -119,8 +119,17 @@ class AzureResourceIngestor:
                         "id": subnet.id,
                         "name": subnet.name,
                         "address_prefix": subnet.address_prefix,
+                        "address_prefixes": (
+                            [subnet.address_prefix] if subnet.address_prefix
+                            else list(subnet.address_prefixes or [])
+                        ),
                         "vnet_name": vnet.name,
                         "nsg_name": self._nsg_name_of(subnet),
+                        "route_table_id": (
+                            subnet.route_table.id.lower()
+                            if subnet.route_table and subnet.route_table.id
+                            else None
+                        ),
                     }
                     vnets_data[vnet_key]["subnets"].append(subnet_data)
 
@@ -524,6 +533,39 @@ class AzureResourceIngestor:
 
         logger.info(f"Found {len(groups)} NSGs")
         return groups
+
+    def get_route_tables(self, subscription_id: str) -> Dict[str, Dict[str, Any]]:
+        """Fetch every route table (UDR set), keyed by lowercased resource ID.
+
+        Subnets name their route table by ID, so keying on it lets a subnet
+        find its table without guessing between same-named tables in
+        different resource groups.
+        """
+        network_client = NetworkManagementClient(
+            self.credential, subscription_id
+        )
+        tables: Dict[str, Dict[str, Any]] = {}
+        for table in network_client.route_tables.list_all():
+            tables[table.id.lower()] = {
+                "id": table.id,
+                "name": table.name,
+                "resource_group": table.id.split("/")[4],
+                "location": table.location,
+                # ARM's flag is negative; carry the positive so a reader
+                # doesn't have to untangle "disable ... = False".
+                "bgp_route_propagation": not table.disable_bgp_route_propagation,
+                "routes": [
+                    {
+                        "name": route.name,
+                        "address_prefix": route.address_prefix or "",
+                        "next_hop_type": self._enum_name(route.next_hop_type),
+                        "next_hop_ip": route.next_hop_ip_address or "",
+                    }
+                    for route in table.routes or []
+                ],
+            }
+        logger.info(f"Found {len(tables)} route tables")
+        return tables
 
     def get_vm_power_states(self, subscription_id: str) -> Dict[str, str]:
         """Map each VM ID (lowercased) to its power state: running, deallocated...

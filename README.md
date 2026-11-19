@@ -63,7 +63,7 @@ else; no topology data leaves the host it runs on.
 
 ## Command-line queries
 
-`app/azmap.py` answers questions about VMs, NICs and NSGs from the terminal,
+`app/azmap.py` answers questions about VMs, NICs, NSGs and subnets from the terminal,
 using the app's own credential — whatever identity the web app resolves on a
 host, the CLI resolves too. It needs nothing beyond `app/requirements.txt`.
 
@@ -72,6 +72,7 @@ python app/azmap.py vms                     # asks for subscription, then resour
 python app/azmap.py vms  --sub Prod --rg 'web-*' --no-nsg
 python app/azmap.py nics --sub Prod --rg '*' --unattached
 python app/azmap.py nsgs --sub Prod --rg hub --vm fw01
+python app/azmap.py subnets --sub Prod --rg '*' --routes
 python app/azmap.py vms  --sub Prod --rg '*' --port 3389 --from internet --access allow
 ```
 
@@ -91,6 +92,7 @@ the rule filters look at both.
 | `vms` | `--os`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules`, `--effective` |
 | `nics` | `--vm`, `--unattached`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules` |
 | `nsgs` | `--vm`, `--subnet`, `--unused` |
+| `subnets` | `--vnet`, `--nsg`, `--no-nsg`, `--route-table`, `--no-udr`, `--routes`, `--rules` |
 
 NSG rule filters, on any command: `--port`, `--from` (`internet`, an IP or
 CIDR, or a service tag), `--access allow|deny`, `--proto`, `--direction`
@@ -140,6 +142,26 @@ the VM behind each), every VM it covers either way, and its rules as separate
 inbound and outbound tables. Add `--defaults` for Azure's built-in rules, which
 complete the picture: without a custom deny, `DenyAllInBound` is what stops
 everything else.
+
+### Subnets, with their NSG and route table
+
+```bash
+python app/azmap.py subnets --sub Prod --rg '*'                 # one row per subnet
+python app/azmap.py subnets --sub Prod --rg '*' --routes        # plus each UDR
+python app/azmap.py subnets --sub Prod --rg '*' --no-udr        # nothing steering traffic
+python app/azmap.py subnets --sub Prod --rg '*' --routes -o csv --out subnets.csv
+```
+
+Each subnet shows its VNet, prefix, the NSG bound to it and the route table
+bound to it, with a count of its routes. `--routes` adds each table's routes
+(prefix, next hop type, next hop IP) and whether BGP route propagation is on;
+`--rules` adds the NSG's rules, and the NSG rule filters work here too. A
+subnet's resource group is its VNet's. `--name` matches `NAME` or `VNET/NAME`.
+
+These are the routes **as written** — the UDRs on the table, not the
+NIC's effective routes, which also carry Azure's system routes and anything
+learned over BGP. With `-o csv --routes` there's a row per route, and a subnet
+without a route table still gets one row, so nothing goes missing from the sheet.
 
 ### Output formats
 
@@ -313,7 +335,7 @@ every source it tried and why each failed. Common causes:
 ├── app/
 │   ├── app.py              # Flask backend
 │   ├── azure_ingest.py     # Azure SDK resource discovery + credential handling
-│   ├── azmap.py            # CLI: query VMs, NICs, NSGs with the same credential
+│   ├── azmap.py            # CLI: query VMs, NICs, NSGs, subnets with the same credential
 │   ├── graph_builder.py    # Topology graph model
 │   ├── requirements.txt
 │   ├── static/

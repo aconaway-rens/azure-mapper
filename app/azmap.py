@@ -3,6 +3,7 @@
     python app/azmap.py vms   [--sub SUB] [--rg RG ...] [filters]
     python app/azmap.py nics  [--sub SUB] [--rg RG ...] [filters]
     python app/azmap.py nsgs  [--sub SUB] [--rg RG ...] [filters]
+    python app/azmap.py subnets [--sub SUB] [--rg RG ...] [filters]
 
 Authentication is the app's own: DefaultAzureCredential, through azure_ingest,
 so whatever identity the web app resolves on this host, the CLI resolves too.
@@ -72,7 +73,7 @@ def matches_any(value: Optional[str], patterns: Iterable[str]) -> bool:
 # ----------------------------------------------------------------- scan ---
 
 def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any]:
-    """Fetch and join VMs, NICs, subnets and NSGs for one subscription.
+    """Fetch and join VMs, NICs, subnets, NSGs and route tables for one subscription.
 
     Every NIC and VM comes back with the NSGs that apply to it, by layer: the
     NSG on the NIC itself, and the NSG on each subnet it sits in. Traffic has
@@ -82,6 +83,7 @@ def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any
     compute = ingestor.get_nics_and_vms(subscription_id, public_ips)
     vnets = ingestor.get_vnets_and_subnets(subscription_id)
     nsgs = ingestor.get_network_security_groups(subscription_id)
+    route_tables = ingestor.get_route_tables(subscription_id)
 
     # NIC records carry lowercased subnet IDs; the VNet listing has the
     # original case, so names print the way they were created.
@@ -159,11 +161,40 @@ def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any
                         layer["nsg"]["vms"].append(vm["name"])
         vms.append(vm)
 
+    # A subnet's resource group is its VNet's: subnets aren't top-level
+    # resources, so that's where the portal shows them too.
+    subnets = []
+    for vnet in vnets.values():
+        for subnet in vnet["subnets"]:
+            key = subnet["id"].lower()
+            path = subnet_names[key]
+            layers = []
+            if key in nsg_on_subnet:
+                layers.append({"layer": "subnet", "attached_to": path, "nsg": nsg_on_subnet[key]})
+            rt_id = subnet["route_table_id"]
+            subnets.append({
+                "id": subnet["id"],
+                "name": subnet["name"],
+                "vnet": vnet["name"],
+                "path": path,
+                "resource_group": vnet["resource_group"],
+                "location": vnet["location"],
+                "address_prefixes": subnet["address_prefixes"],
+                "layers": layers,
+                # A table we couldn't list (another subscription, no access)
+                # still shows by name, from the last segment of its ID.
+                "route_table": route_tables.get(rt_id) if rt_id else None,
+                "route_table_id": rt_id,
+            })
+
     by_name = lambda o: (o["resource_group"].lower(), o["name"].lower())
     return {
         "vms": sorted(vms, key=by_name),
         "nics": sorted(nics.values(), key=by_name),
         "nsgs": sorted(nsgs, key=by_name),
+        "subnets": sorted(subnets, key=lambda o: (
+            o["resource_group"].lower(), o["vnet"].lower(), o["name"].lower(),
+        )),
         "subnet_names": subnet_names,
     }
 
@@ -345,8 +376,28 @@ def shown_rules(nsg: Dict[str, Any], args) -> List[Dict[str, Any]]:
 def keep(obj: Dict[str, Any], args, kind: str, rules_as_written: bool = True) -> bool:
     if args.rg_patterns is not None and not matches_any(obj["resource_group"], args.rg_patterns):
         return False
-    if args.name and not matches_any(obj["name"], args.name):
+    if args.name and not (
+        matches_any(obj["name"], args.name)
+        or (kind == "subnets" and matches_any(obj["path"], args.name))
+    ):
         return False
+
+    if kind == "subnets":
+        nsg_names = [layer["nsg"]["name"] for layer in obj["layers"]]
+        if args.vnet and not matches_any(obj["vnet"], args.vnet):
+            return False
+        if args.nsg and not any(matches_any(n, args.nsg) for n in nsg_names):
+            return False
+        if args.no_nsg and nsg_names:
+            return False
+        if args.route_table and not matches_any(route_table_name(obj), args.route_table):
+            return False
+        if args.no_udr and obj["route_table_id"]:
+            return False
+        if rule_filter_active(args) and not any(
+            shown_rules(layer["nsg"], args) for layer in obj["layers"]
+        ):
+            return False
 
     if kind in ("vms", "nics"):
         nsg_names = [layer["nsg"]["name"] for layer in obj["layers"]]
@@ -529,7 +580,34 @@ def nsg_cell(layers: List[Dict[str, Any]]) -> str:
     return ", ".join(f"{l['nsg']['name']} ({l['layer']})" for l in layers)
 
 
+def route_table_name(subnet: Dict[str, Any]) -> Optional[str]:
+    if subnet["route_table"]:
+        return subnet["route_table"]["name"]
+    if subnet["route_table_id"]:
+        return subnet["route_table_id"].split("/")[-1]
+    return None
+
+
+def route_table_cell(subnet: Dict[str, Any]) -> str:
+    table = subnet["route_table"]
+    if table:
+        count = len(table["routes"])
+        return f"{table['name']} ({count} route{'' if count == 1 else 's'})"
+    if subnet["route_table_id"]:
+        return f"{route_table_name(subnet)} (not readable)"
+    return "none"
+
+
 def object_row(obj: Dict[str, Any], kind: str) -> List[str]:
+    if kind == "subnets":
+        return [
+            obj["vnet"],
+            obj["name"],
+            obj["resource_group"],
+            " ".join(obj["address_prefixes"]),
+            ", ".join(l["nsg"]["name"] for l in obj["layers"]) or "none",
+            route_table_cell(obj),
+        ]
     if kind == "vms":
         nics = obj["nics"]
         return [
@@ -556,7 +634,30 @@ def object_row(obj: Dict[str, Any], kind: str) -> List[str]:
 OBJECT_HEADERS = {
     "vms": ["NAME", "RESOURCE GROUP", "SIZE", "OS", "PRIVATE IP", "PUBLIC IP", "SUBNET", "NSG"],
     "nics": ["NAME", "RESOURCE GROUP", "VM", "PRIVATE IP", "PUBLIC IP", "SUBNET", "NSG"],
+    "subnets": ["VNET", "SUBNET", "RESOURCE GROUP", "PREFIX", "NSG", "ROUTE TABLE"],
 }
+
+ROUTE_HEADERS = ["ROUTE", "ADDRESS PREFIX", "NEXT HOP", "NEXT HOP IP"]
+
+
+def route_row(route: Dict[str, Any]) -> List[str]:
+    return [route["name"], route["address_prefix"], route["next_hop_type"], route["next_hop_ip"]]
+
+
+def print_routes(subnet: Dict[str, Any], indent: str) -> None:
+    table = subnet["route_table"]
+    if not subnet["route_table_id"]:
+        print(f"{indent}no route table; Azure's system routes apply")
+        return
+    if not table:
+        print(f"{indent}route table {route_table_name(subnet)}  (couldn't be read)")
+        return
+    bgp = "on" if table["bgp_route_propagation"] else "off"
+    print(f"{indent}route table {table['name']}  ({table['resource_group']}; BGP route propagation {bgp})")
+    if table["routes"]:
+        print_table(ROUTE_HEADERS, [route_row(r) for r in table["routes"]], indent + "  ")
+    else:
+        print(f"{indent}  (no routes)")
 
 
 def print_rules(nsg: Dict[str, Any], args, indent: str) -> None:
@@ -670,6 +771,21 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
         return
 
     print_table(OBJECT_HEADERS[kind], [object_row(o, kind) for o in objects])
+    if kind == "subnets":
+        if not (args.show_rules or args.show_routes):
+            return
+        for subnet in objects:
+            print()
+            print(f"{subnet['path']}  ({subnet['resource_group']}, {' '.join(subnet['address_prefixes'])})")
+            if args.show_routes:
+                print_routes(subnet, "  ")
+            if args.show_rules:
+                if not subnet["layers"]:
+                    print("  no NSG")
+                for layer in subnet["layers"]:
+                    print(f"  NSG {layer['nsg']['name']}")
+                    print_rules(layer["nsg"], args, "    ")
+        return
     if not args.show_rules:
         return
     for obj in objects:
@@ -752,6 +868,33 @@ def effective_json(nic: Dict[str, Any], args) -> Dict[str, Any]:
     return entry
 
 
+def subnet_json(subnet: Dict[str, Any], args) -> Dict[str, Any]:
+    nsg = None
+    for layer in subnet["layers"]:
+        nsg = {"name": layer["nsg"]["name"], "id": layer["nsg"]["id"]}
+        if args.show_rules:
+            nsg["rules"] = shown_rules(layer["nsg"], args)
+    table = subnet["route_table"]
+    if table:
+        route_table = {k: table[k] for k in
+                       ("name", "id", "resource_group", "bgp_route_propagation", "routes")}
+    elif subnet["route_table_id"]:
+        route_table = {"name": route_table_name(subnet), "id": subnet["route_table_id"],
+                       "error": "couldn't be read"}
+    else:
+        route_table = None
+    return {
+        "name": subnet["name"],
+        "vnet": subnet["vnet"],
+        "id": subnet["id"],
+        "resource_group": subnet["resource_group"],
+        "location": subnet["location"],
+        "address_prefixes": subnet["address_prefixes"],
+        "nsg": nsg,
+        "route_table": route_table,
+    }
+
+
 def structured(objects: List[Dict[str, Any]], args, kind: str) -> List[Dict[str, Any]]:
     """The output as plain data, for JSON and YAML alike."""
     if args.effective:
@@ -766,6 +909,8 @@ def structured(objects: List[Dict[str, Any]], args, kind: str) -> List[Dict[str,
         } for vm in objects]
     elif kind == "nsgs":
         data = [nsg_json(n, args) for n in objects]
+    elif kind == "subnets":
+        data = [subnet_json(n, args) for n in objects]
     elif kind == "nics":
         data = [nic_json(n, args) for n in objects]
     else:
@@ -888,6 +1033,18 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
                 writer.writerow([nsg["name"], nsg["resource_group"]] + rule_row(rule))
         return
 
+    if kind == "subnets" and args.show_routes:
+        # Every subnet gets at least one row, so one without a UDR is
+        # still in the sheet rather than silently missing from it.
+        writer.writerow(OBJECT_HEADERS[kind] + ROUTE_HEADERS)
+        for subnet in objects:
+            row = object_row(subnet, kind)
+            row[-1] = route_table_name(subnet) or ""
+            routes = (subnet["route_table"] or {}).get("routes") or [None]
+            for route in routes:
+                writer.writerow(row + (route_row(route) if route else [""] * len(ROUTE_HEADERS)))
+        return
+
     if not args.show_rules:
         writer.writerow(OBJECT_HEADERS[kind])
         for obj in objects:
@@ -899,14 +1056,14 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
         for layer in obj["layers"]:
             for rule in shown_rules(layer["nsg"], args):
                 writer.writerow(
-                    [obj["name"], obj["resource_group"], layer["layer"], layer["nsg"]["name"]]
+                    [obj.get("path", obj["name"]), obj["resource_group"], layer["layer"], layer["nsg"]["name"]]
                     + rule_row(rule)
                 )
 
 
 # ------------------------------------------------------------------ main ---
 
-NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs"}
+NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs", "subnets": "subnets"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -951,7 +1108,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="azmap",
-        description="Query VMs, NICs and NSGs with the web app's Azure identity.",
+        description="Query VMs, NICs, NSGs and subnets with the web app's Azure identity.",
         epilog="Example: azmap vms --port 3389 --from internet --access allow",
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -980,6 +1137,20 @@ def build_parser() -> argparse.ArgumentParser:
     nsgs.add_argument("--vm", action="append", metavar="GLOB", help="guards this VM")
     nsgs.add_argument("--unused", action="store_true", help="attached to nothing")
 
+    subnets = commands.add_parser(
+        "subnets", parents=[common], help="subnets, with their NSG and route table (UDRs)",
+    )
+    subnets.add_argument("--vnet", action="append", metavar="GLOB", help="VNet name")
+    subnets.add_argument("--nsg", action="append", metavar="GLOB", help="NSG on the subnet")
+    subnets.add_argument("--no-nsg", action="store_true", help="no NSG on the subnet")
+    subnets.add_argument("--route-table", action="append", metavar="GLOB",
+                         help="route table on the subnet")
+    subnets.add_argument("--no-udr", action="store_true", help="no route table on the subnet")
+    subnets.add_argument("--routes", dest="show_routes", action="store_true",
+                         help="list the routes in each subnet's route table")
+    subnets.add_argument("--rules", dest="show_rules", action="store_true",
+                         help="list the rules of each subnet's NSG")
+
     for sub in (vms, nics, nsgs):
         sub.add_argument("--subnet", action="append", metavar="GLOB",
                          help="subnet, as NAME or VNET/NAME")
@@ -994,6 +1165,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.direction = "in" if rule_filter_active(args) else "any"
     # A rule filter on VMs or NICs is a question about rules; show the answer.
     args.show_rules = kind == "nsgs" or getattr(args, "show_rules", False) or rule_filter_active(args)
+    args.show_routes = getattr(args, "show_routes", False)
+    if kind == "subnets" and args.output == "csv" and args.show_rules and args.show_routes:
+        parser.error("-o csv takes --routes or NSG rules, not both: one is a row per "
+                     "route, the other a row per rule")
 
     logging.basicConfig(level=logging.WARNING)
 
