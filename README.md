@@ -63,7 +63,7 @@ else; no topology data leaves the host it runs on.
 
 ## Command-line queries
 
-`app/azmap.py` answers questions about VMs, NICs, NSGs and subnets from the terminal,
+`app/azmap.py` answers questions about VMs, NICs, NSGs, subnets and VPN gateways from the terminal,
 using the app's own credential — whatever identity the web app resolves on a
 host, the CLI resolves too. It needs nothing beyond `app/requirements.txt`.
 
@@ -105,6 +105,9 @@ the rule filters look at both.
 | `nics` | `--vm`, `--unattached`, `--subnet`, `--nsg`, `--no-nsg`, `--public-ip`, `--rules` |
 | `nsgs` | `--vm`, `--subnet`, `--unused` |
 | `subnets` | `--vnet`, `--nsg`, `--no-nsg`, `--route-table`, `--no-udr`, `--routes`, `--rules` |
+| `gateways` | `--type vpn\|expressroute`, `--detail` |
+| `local-gateways` | `--unused`, `--detail` |
+| `connections` | `--type`, `--status`, `--gateway`, `--remote`, `--detail` |
 
 NSG rule filters, on any command: `--port`, `--from` (`internet`, an IP or
 CIDR, or a service tag), `--access allow|deny`, `--proto`, `--direction`
@@ -174,6 +177,35 @@ These are the routes **as written** — the UDRs on the table, not the
 NIC's effective routes, which also carry Azure's system routes and anything
 learned over BGP. With `-o csv --routes` there's a row per route, and a subnet
 without a route table still gets one row, so nothing goes missing from the sheet.
+
+### VPN: gateways, local gateways and connections
+
+```bash
+python app/azmap.py gateways       --sub '*' --rg '*'           # VPN and ExpressRoute gateways
+python app/azmap.py local-gateways --sub '*' --rg '*'           # the on-prem side
+python app/azmap.py connections    --sub '*' --rg '*'           # tunnels, with live status
+python app/azmap.py connections    --sub Prod --rg '*' --status notconnected
+python app/azmap.py gateways       --sub Prod --rg '*' --detail # every setting
+python app/azmap.py connections    --sub '*' --rg '*' -o yaml --out vpn-connections.yaml
+```
+
+The tables summarise: a gateway's type, SKU, generation, active-active, BGP
+ASN and peering address, public IPs, VNet, point-to-site pool and the
+connections on it; a local gateway's address or FQDN, address space and BGP
+peer; a connection's type, status, both ends, IKE version, BGP and custom
+IPsec policy (`default` when none is set). The objects are linked, so a
+connection names its gateway and remote end and each gateway lists its
+connections, across subscriptions too.
+
+`--detail`, `-o json` and `-o yaml` carry **every setting** Azure returns,
+under its own names — the same `properties` that `az network vnet-gateway show`
+prints — so nothing is left out for want of a column. Pre-shared keys and
+RADIUS secrets are always removed: they'd otherwise land in files.
+
+Reading these takes Reader. The resource types are found through the
+subscription's resource listing, then each is read individually, which is
+what returns a connection's live status; one that can't be read is listed as
+`(unreadable)` with the reason.
 
 ### Output formats
 
@@ -347,7 +379,7 @@ every source it tried and why each failed. Common causes:
 ├── app/
 │   ├── app.py              # Flask backend
 │   ├── azure_ingest.py     # Azure SDK resource discovery + credential handling
-│   ├── azmap.py            # CLI: query VMs, NICs, NSGs, subnets with the same credential
+│   ├── azmap.py            # CLI: query VMs, NICs, NSGs, subnets, VPN with the same credential
 │   ├── graph_builder.py    # Topology graph model
 │   ├── requirements.txt
 │   ├── static/

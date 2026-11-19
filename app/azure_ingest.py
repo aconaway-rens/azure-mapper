@@ -10,14 +10,50 @@ import base64
 import binascii
 import json
 import logging
+import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
+
+from azure.core.exceptions import HttpResponseError
 
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.subscription import SubscriptionClient
 
+# azure-mgmt-resource 26 moved the client into a subpackage; older releases,
+# which hosts installed before that may still have, export it at the top.
+try:
+    from azure.mgmt.resource.resources import ResourceManagementClient
+except ImportError:  # pragma: no cover - depends on the installed version
+    from azure.mgmt.resource import ResourceManagementClient
+
 logger = logging.getLogger(__name__)
+
+# VPN resource types, by the key get_vpn_inventory files them under. ARM
+# lists these only per resource group, so they're found through the generic
+# resources listing (one call per type, whole subscription) and then read
+# one by one, which is also what returns a connection's live status.
+VPN_TYPES = {
+    "gateways": ("Microsoft.Network/virtualNetworkGateways", "virtual_network_gateways"),
+    "local_gateways": ("Microsoft.Network/localNetworkGateways", "local_network_gateways"),
+    "connections": (
+        "Microsoft.Network/connections", "virtual_network_gateway_connections",
+    ),
+}
+
+# Never carried into output: a pre-shared key or RADIUS secret written into
+# a CSV or YAML file is a credential leak. ARM usually withholds them from a
+# GET anyway; this is the belt to that pair of braces.
+SECRET_KEY = re.compile(r"sharedkey|secret|password", re.IGNORECASE)
+
+
+def _without_secrets(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _without_secrets(v) for k, v in value.items() if not SECRET_KEY.search(k)}
+    if isinstance(value, list):
+        return [_without_secrets(v) for v in value]
+    return value
 
 ARM_SCOPE = "https://management.azure.com/.default"
 
@@ -582,6 +618,53 @@ class AzureResourceIngestor:
             }
         logger.info(f"Found {len(tables)} route tables")
         return tables
+
+    def get_vpn_inventory(self, subscription_id: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Every VPN/ExpressRoute gateway, local network gateway and connection.
+
+        Each comes back with its full ARM ``properties`` as Azure names them
+        (the JSON ``az network ... show`` prints), secrets removed, so every
+        setting is there without this code having to know about it.
+        """
+        resources = ResourceManagementClient(self.credential, subscription_id)
+        network_client = NetworkManagementClient(self.credential, subscription_id)
+
+        found = []
+        for key, (arm_type, _) in VPN_TYPES.items():
+            for res in resources.resources.list(filter=f"resourceType eq '{arm_type}'"):
+                found.append((key, res.id))
+
+        def read(item):
+            key, resource_id = item
+            parts = resource_id.split("/")
+            entry = {
+                "id": resource_id,
+                "name": parts[-1],
+                "resource_group": parts[4],
+                "location": "",
+                "tags": {},
+                "properties": {},
+            }
+            try:
+                obj = getattr(network_client, VPN_TYPES[key][1]).get(parts[4], parts[-1])
+            except HttpResponseError as e:
+                entry["error"] = (e.message or str(e)).splitlines()[0]
+                return key, entry
+            raw = obj.as_dict()
+            entry.update(
+                id=obj.id or resource_id,
+                location=raw.get("location", ""),
+                tags=raw.get("tags") or {},
+                properties=_without_secrets(raw.get("properties") or {}),
+            )
+            return key, entry
+
+        inventory: Dict[str, List[Dict[str, Any]]] = {k: [] for k in VPN_TYPES}
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for key, entry in pool.map(read, found):
+                inventory[key].append(entry)
+        logger.info(", ".join(f"{len(v)} {k}" for k, v in inventory.items()))
+        return inventory
 
     def get_vm_power_states(self, subscription_id: str) -> Dict[str, str]:
         """Map each VM ID (lowercased) to its power state: running, deallocated...

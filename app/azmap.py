@@ -4,6 +4,7 @@
     python app/azmap.py nics  [--sub SUB] [--rg RG ...] [filters]
     python app/azmap.py nsgs  [--sub SUB] [--rg RG ...] [filters]
     python app/azmap.py subnets [--sub SUB] [--rg RG ...] [filters]
+    python app/azmap.py gateways | local-gateways | connections [--detail]
 
 Authentication is the app's own: DefaultAzureCredential, through azure_ingest,
 so whatever identity the web app resolves on this host, the CLI resolves too.
@@ -73,13 +74,15 @@ def matches_any(value: Optional[str], patterns: Iterable[str]) -> bool:
 
 # ----------------------------------------------------------------- scan ---
 
-def scan(ingestor: AzureResourceIngestor, subscription: Dict[str, Any]) -> Dict[str, Any]:
+def scan(ingestor: AzureResourceIngestor, subscription: Dict[str, Any], kind: str) -> Dict[str, Any]:
     """Fetch and join VMs, NICs, subnets, NSGs and route tables for one subscription.
 
     Every NIC and VM comes back with the NSGs that apply to it, by layer: the
     NSG on the NIC itself, and the NSG on each subnet it sits in. Traffic has
     to pass both, so both are listed.
     """
+    if kind in VPN_KINDS:
+        return scan_vpn(ingestor, subscription)
     subscription_id = subscription["id"]
     public_ips = ingestor.get_public_ips(subscription_id)
     compute = ingestor.get_nics_and_vms(subscription_id, public_ips)
@@ -290,41 +293,271 @@ def choose_subscriptions(
             note(f"  Not in the list: {e}")
 
 
-def scan_all(ingestor: AzureResourceIngestor, subscriptions: List[Dict[str, Any]]) -> Dict[str, Any]:
+def scan_all(
+    ingestor: AzureResourceIngestor, subscriptions: List[Dict[str, Any]], kind: str,
+) -> Dict[str, Any]:
     """Scan each subscription, in parallel, into one inventory.
 
     A subscription that fails (no access, a provider not registered) is
     reported and left out, so one bad subscription doesn't sink a run over
-    all of them.
+    all of them. With only one, its failure is the run's.
     """
     if len(subscriptions) == 1:
         note(f"Scanning {subscriptions[0]['name']}...")
-        return scan(ingestor, subscriptions[0])
+        inventories = [scan(ingestor, subscriptions[0], kind)]
+    else:
+        note(f"Scanning {len(subscriptions)} subscriptions...")
 
-    note(f"Scanning {len(subscriptions)} subscriptions...")
+        def one(sub):
+            try:
+                return scan(ingestor, sub, kind)
+            except HttpResponseError as e:
+                note(f"  Skipped {sub['name']}: {(e.message or str(e)).splitlines()[0]}")
+                return None
 
-    def one(sub):
-        try:
-            return scan(ingestor, sub)
-        except HttpResponseError as e:
-            note(f"  Skipped {sub['name']}: {(e.message or str(e)).splitlines()[0]}")
-            return None
-
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        inventories = [i for i in pool.map(one, subscriptions) if i]
-    if not inventories:
-        raise SystemExit("Every subscription failed to scan.")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            inventories = [i for i in pool.map(one, subscriptions) if i]
+        if not inventories:
+            raise SystemExit("Every subscription failed to scan.")
 
     merged: Dict[str, Any] = {"subnet_names": {}}
-    for kind in ("vms", "nics", "nsgs", "subnets"):
-        merged[kind] = sorted(
-            (o for inv in inventories for o in inv[kind]),
+    for key in inventories[0]:
+        if key == "subnet_names":
+            continue
+        merged[key] = sorted(
+            (o for inv in inventories for o in inv[key]),
             key=lambda o: (o["subscription"].lower(), o["resource_group"].lower(),
-                           o.get("vnet", "").lower(), o["name"].lower()),
+                           (o.get("vnet") or "").lower(), o["name"].lower()),
         )
     for inv in inventories:
         merged["subnet_names"].update(inv["subnet_names"])
+    if kind in VPN_KINDS:
+        # Linked after the merge, so a connection to a gateway in another
+        # subscription still finds it.
+        link_vpn(merged)
     return merged
+
+
+# ------------------------------------------------------------------- vpn ---
+
+VPN_KINDS = ("gateways", "local-gateways", "connections")
+
+
+def ref_id(value: Any) -> Optional[str]:
+    """The resource ID out of an ARM reference ({"id": ...}), lowercased."""
+    if isinstance(value, dict) and value.get("id"):
+        return value["id"].lower()
+    return None
+
+
+def scan_vpn(ingestor: AzureResourceIngestor, subscription: Dict[str, Any]) -> Dict[str, Any]:
+    """Gateways, local gateways and connections, with public IPs resolved."""
+    subscription_id = subscription["id"]
+    public_ips = ingestor.get_public_ips(subscription_id)
+    raw = ingestor.get_vpn_inventory(subscription_id)
+
+    for gw in raw["gateways"]:
+        gw["public_ips"], vnets = [], []
+        for config in gw["properties"].get("ipConfigurations") or []:
+            props = config.get("properties") or {}
+            pip = ref_id(props.get("publicIPAddress"))
+            if pip:
+                entry = public_ips.get(pip) or {}
+                gw["public_ips"].append({
+                    "name": entry.get("name") or pip.split("/")[-1],
+                    "address": entry.get("ip_address") or ("(unassigned)" if entry else "(unknown)"),
+                })
+            subnet = (props.get("subnet") or {}).get("id")
+            if subnet and len(subnet.split("/")) > 8 and subnet.split("/")[8] not in vnets:
+                vnets.append(subnet.split("/")[8])
+        gw["vnet"] = ", ".join(vnets)
+
+    inventory = {
+        "gateways": raw["gateways"],
+        "local-gateways": raw["local_gateways"],
+        "connections": raw["connections"],
+        "subnet_names": {},
+    }
+    for objects in (v for k, v in inventory.items() if k != "subnet_names"):
+        for obj in objects:
+            obj["subscription"] = subscription["name"]
+            obj["subscription_id"] = subscription_id
+            obj.setdefault("connections", [])
+    return inventory
+
+
+def link_vpn(inventory: Dict[str, Any]) -> None:
+    """Tie each connection to its gateway and remote end, and back again."""
+    by_id = {
+        o["id"].lower(): o
+        for key in ("gateways", "local-gateways") for o in inventory.get(key, [])
+    }
+    for conn in inventory.get("connections", []):
+        props = conn["properties"]
+        conn.pop("connections", None)
+        gw_id = ref_id(props.get("virtualNetworkGateway1"))
+        gw = by_id.get(gw_id) if gw_id else None
+        conn["gateway"] = gw["name"] if gw else (gw_id.split("/")[-1] if gw_id else "")
+        if gw:
+            gw["connections"].append(conn["name"])
+
+        remote = {"kind": "", "name": "", "address": ""}
+        for field, label in (("localNetworkGateway2", "local gateway"),
+                             ("virtualNetworkGateway2", "gateway"),
+                             ("peer", "ExpressRoute circuit")):
+            rid = ref_id(props.get(field))
+            if not rid:
+                continue
+            target = by_id.get(rid)
+            remote["kind"] = label
+            remote["name"] = target["name"] if target else rid.split("/")[-1]
+            if target:
+                if conn["name"] not in target["connections"]:
+                    target["connections"].append(conn["name"])
+                tprops = target["properties"]
+                remote["address"] = (
+                    tprops.get("gatewayIpAddress") or tprops.get("fqdn")
+                    or " ".join(p["address"] for p in target.get("public_ips", []))
+                )
+            break
+        conn["remote"] = remote
+
+
+def yes_no(value: Any) -> str:
+    return "yes" if value else "no"
+
+
+def ipsec_cell(props: Dict[str, Any]) -> str:
+    policies = props.get("ipsecPolicies") or []
+    if not policies:
+        return "default"
+    p = policies[0]
+    text = (f"IKE {p.get('ikeEncryption')}/{p.get('ikeIntegrity')}/{p.get('dhGroup')}, "
+            f"IPsec {p.get('ipsecEncryption')}/{p.get('ipsecIntegrity')}/{p.get('pfsGroup')}")
+    return text + (f" +{len(policies) - 1} more" if len(policies) > 1 else "")
+
+
+def bgp_cell(settings: Optional[Dict[str, Any]], enabled: bool = True) -> str:
+    if not enabled or not settings or not settings.get("asn"):
+        return "off"
+    peer = settings.get("bgpPeeringAddress")
+    return f"ASN {settings['asn']}" + (f" peer {peer}" if peer else "")
+
+
+VPN_HEADERS = {
+    "gateways": ["NAME", "RESOURCE GROUP", "TYPE", "VPN TYPE", "SKU", "GEN", "ACTIVE-ACTIVE",
+                 "BGP", "PUBLIC IP", "VNET", "P2S POOL", "CONNECTIONS"],
+    "local-gateways": ["NAME", "RESOURCE GROUP", "ADDRESS", "ADDRESS SPACE", "BGP", "CONNECTIONS"],
+    "connections": ["NAME", "RESOURCE GROUP", "TYPE", "STATUS", "GATEWAY", "REMOTE",
+                    "REMOTE ADDRESS", "PROTOCOL", "BGP", "IPSEC POLICY"],
+}
+
+
+def vpn_row(obj: Dict[str, Any], kind: str, cap: Optional[int] = None) -> List[str]:
+    if obj.get("error"):
+        # Blank rather than "no"/"default", which would read as settings.
+        cells = [obj["name"], obj["resource_group"]] + [""] * (len(VPN_HEADERS[kind]) - 2)
+        cells[3 if kind == "connections" else 2] = "(unreadable)"
+        return cells
+    props = obj["properties"]
+    if kind == "gateways":
+        p2s = ((props.get("vpnClientConfiguration") or {}).get("vpnClientAddressPool") or {})
+        return [
+            obj["name"], obj["resource_group"],
+            props.get("gatewayType") or "",
+            props.get("vpnType") or "",
+            (props.get("sku") or {}).get("name") or "",
+            (props.get("vpnGatewayGeneration") or "").replace("Generation", "Gen").replace("None", ""),
+            yes_no(props.get("activeActive")),
+            bgp_cell(props.get("bgpSettings"), props.get("enableBgp")),
+            " ".join(f"{p['address']} ({p['name']})" for p in obj["public_ips"]),
+            obj["vnet"],
+            join_list(p2s.get("addressPrefixes") or [], cap) or "none",
+            join_list(obj["connections"], cap),
+        ]
+    if kind == "local-gateways":
+        space = (props.get("localNetworkAddressSpace") or {}).get("addressPrefixes") or []
+        return [
+            obj["name"], obj["resource_group"],
+            props.get("gatewayIpAddress") or props.get("fqdn") or "",
+            join_list(space, cap),
+            bgp_cell(props.get("bgpSettings")),
+            join_list(obj["connections"], cap),
+        ]
+    remote = obj.get("remote") or {}
+    return [
+        obj["name"], obj["resource_group"],
+        props.get("connectionType") or "",
+        props.get("connectionStatus") or "",
+        obj.get("gateway") or "",
+        f"{remote['name']} ({remote['kind']})" if remote.get("name") else "",
+        remote.get("address") or "",
+        props.get("connectionProtocol") or "",
+        yes_no(props.get("enableBgp")),
+        ipsec_cell(props),
+    ]
+
+
+def vpn_json(obj: Dict[str, Any]) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "name": obj["name"],
+        "id": obj["id"],
+        "resource_group": obj["resource_group"],
+        "location": obj["location"],
+    }
+    if "public_ips" in obj:
+        entry["vnet"] = obj["vnet"]
+        entry["public_ips"] = obj["public_ips"]
+    if "gateway" in obj:
+        entry["gateway"] = obj["gateway"]
+        entry["remote"] = obj["remote"]
+    else:
+        entry["connections"] = obj["connections"]
+    if obj.get("error"):
+        entry["error"] = obj["error"]
+    entry["tags"] = obj["tags"]
+    # Every setting Azure returned, under Azure's own names.
+    entry["properties"] = obj["properties"]
+    return entry
+
+
+def vpn_keep(obj: Dict[str, Any], args, kind: str) -> bool:
+    props = obj["properties"]
+    if kind == "gateways" and args.type and (props.get("gatewayType") or "").lower() != args.type:
+        return False
+    if kind == "local-gateways" and args.unused and obj["connections"]:
+        return False
+    if kind == "connections":
+        if args.type and (props.get("connectionType") or "").lower() != args.type:
+            return False
+        if args.status and (props.get("connectionStatus") or "").lower() != args.status:
+            return False
+        if args.gateway and not matches_any(obj.get("gateway"), args.gateway):
+            return False
+        remote = obj.get("remote") or {}
+        if args.remote and not (
+            matches_any(remote.get("name"), args.remote) or matches_any(remote.get("address"), args.remote)
+        ):
+            return False
+    return True
+
+
+def render_vpn_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
+    cap = None if args.full else CELL_WIDTH
+    print_table(sub_head(args) + VPN_HEADERS[kind],
+                [sub_cols(o, args) + vpn_row(o, kind, cap) for o in objects])
+    for obj in objects:
+        if obj.get("error"):
+            note(f"{obj['name']}: couldn't be read: {obj['error']}")
+    if not args.detail:
+        return
+    for obj in objects:
+        print()
+        print(f"{obj['name']}  ({where(obj, args)}, {obj['location']})")
+        detail = {k: v for k, v in vpn_json(obj).items()
+                  if k not in ("name", "resource_group", "location")}
+        for line in yaml_lines(detail, 1):
+            print(line)
 
 
 def sub_head(args) -> List[str]:
@@ -480,6 +713,8 @@ def keep(obj: Dict[str, Any], args, kind: str, rules_as_written: bool = True) ->
         or (kind == "subnets" and matches_any(obj["path"], args.name))
     ):
         return False
+    if kind in VPN_KINDS:
+        return vpn_keep(obj, args, kind)
 
     if kind == "subnets":
         nsg_names = [layer["nsg"]["name"] for layer in obj["layers"]]
@@ -857,6 +1092,9 @@ def render_effective_table(vms: List[Dict[str, Any]], args) -> None:
 
 
 def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
+    if kind in VPN_KINDS:
+        render_vpn_table(objects, args, kind)
+        return
     if args.effective:
         render_effective_table(objects, args)
         return
@@ -1018,6 +1256,8 @@ def structured(objects: List[Dict[str, Any]], args, kind: str) -> List[Dict[str,
         data = [nsg_json(n, args) for n in objects]
     elif kind == "subnets":
         data = [subnet_json(n, args) for n in objects]
+    elif kind in VPN_KINDS:
+        data = [vpn_json(n) for n in objects]
     elif kind == "nics":
         data = [nic_json(n, args) for n in objects]
     else:
@@ -1138,6 +1378,11 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
     def row(obj: Dict[str, Any], cells: List[str]) -> None:
         writer.writerow(sub_cols(obj, args) + cells)
 
+    if kind in VPN_KINDS:
+        head(VPN_HEADERS[kind])
+        for obj in objects:
+            row(obj, vpn_row(obj, kind))
+        return
     if args.effective:
         head(["VM", "RESOURCE GROUP", "NIC", "PUBLIC IP", "PUBLIC IP NAME", "LAYER", "NSG"] + RULE_HEADERS)
         for vm in objects:
@@ -1184,7 +1429,9 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
 
 # ------------------------------------------------------------------ main ---
 
-NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs", "subnets": "subnets"}
+NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs", "subnets": "subnets",
+         "gateways": "gateways", "local-gateways": "local gateways",
+         "connections": "connections"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1232,7 +1479,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="azmap",
-        description="Query VMs, NICs, NSGs and subnets with the web app's Azure identity.",
+        description="Query VMs, NICs, NSGs, subnets and VPN gateways with the web app's Azure identity.",
         epilog="Example: azmap vms --port 3389 --from internet --access allow",
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -1275,6 +1522,28 @@ def build_parser() -> argparse.ArgumentParser:
     subnets.add_argument("--rules", dest="show_rules", action="store_true",
                          help="list the rules of each subnet's NSG")
 
+    gateways = commands.add_parser(
+        "gateways", parents=[common], help="VPN and ExpressRoute gateways, with every setting",
+    )
+    gateways.add_argument("--type", type=str.lower, choices=["vpn", "expressroute"])
+    local_gws = commands.add_parser(
+        "local-gateways", parents=[common], help="local network gateways (the on-prem side)",
+    )
+    local_gws.add_argument("--unused", action="store_true", help="no connection uses it")
+    connections = commands.add_parser(
+        "connections", parents=[common], help="gateway connections (site-to-site, VNet-to-VNet, ExpressRoute)",
+    )
+    connections.add_argument("--type", type=str.lower,
+                             choices=["ipsec", "vnet2vnet", "expressroute", "vpnclient"])
+    connections.add_argument("--status", type=str.lower,
+                             choices=["connected", "notconnected", "connecting", "unknown"])
+    connections.add_argument("--gateway", action="append", metavar="GLOB", help="Azure-side gateway")
+    connections.add_argument("--remote", action="append", metavar="GLOB",
+                             help="remote end: local gateway, gateway or circuit name, or its address")
+    for sub in (gateways, local_gws, connections):
+        sub.add_argument("--detail", action="store_true",
+                         help="every setting of each, below the table (as -o yaml has)")
+
     for sub in (vms, nics, nsgs):
         sub.add_argument("--subnet", action="append", metavar="GLOB",
                          help="subnet, as NAME or VNET/NAME")
@@ -1307,7 +1576,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ingestor = AzureResourceIngestor()
     subs = choose_subscriptions(ingestor, args.sub)
     args.multi_sub = len(subs) > 1
-    inventory = scan_all(ingestor, subs)
+    args.detail = getattr(args, "detail", False)
+    inventory = scan_all(ingestor, subs, kind)
 
     objects = inventory[kind]
     args.rg_patterns = choose_resource_groups(objects, NOUNS[kind], args.rg)
