@@ -317,6 +317,18 @@ class AzureResourceIngestor:
             return "(unknown)"
         return entry.get("ip_address") or "(unassigned)"
 
+    @staticmethod
+    def _public_ip_name_of(reference: Any, public_ips: Dict[str, Dict[str, Any]]):
+        """The public IP resource's name, or None if nothing is attached.
+
+        Falls back to the last segment of the reference's ID, so a public IP
+        this scan couldn't list still shows its name.
+        """
+        if not reference or not getattr(reference, "id", None):
+            return None
+        entry = public_ips.get(reference.id.lower())
+        return entry["name"] if entry else reference.id.split("/")[-1]
+
     def get_nics_and_vms(
         self,
         subscription_id: str,
@@ -377,6 +389,10 @@ class AzureResourceIngestor:
                     "subnet_id": ip_config.subnet.id.lower(),
                     "private_ip": ip_config.private_ip_address,
                     "public_ip": self._public_ip_of(
+                        getattr(ip_config, "public_ip_address", None),
+                        public_ips,
+                    ),
+                    "public_ip_name": self._public_ip_name_of(
                         getattr(ip_config, "public_ip_address", None),
                         public_ips,
                     ),

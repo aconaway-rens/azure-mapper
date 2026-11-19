@@ -74,6 +74,7 @@ python app/azmap.py nics --sub Prod --rg '*' --unattached
 python app/azmap.py nsgs --sub Prod --rg hub --vm fw01
 python app/azmap.py subnets --sub Prod --rg '*' --routes
 python app/azmap.py vms  --sub Prod --rg '*' --port 3389 --from internet --access allow
+python app/azmap.py vms  --sub '*' --rg '*'    # every VM in every subscription
 ```
 
 Scope works in the app's two stages: the subscription is scanned once, then
@@ -81,6 +82,17 @@ resource groups are picked from what the scan found. Leave out `--sub` or
 `--rg` on a terminal and it lists the choices and asks, then prints the flags
 that would skip the questions next time. Piped or scripted, a missing `--rg`
 means every group, and a missing `--sub` is an error unless only one is visible.
+
+`--sub` repeats and takes wildcards; `--sub '*'` scans every subscription the
+identity can see, in parallel, and adds a SUBSCRIPTION column to tables and
+CSVs (JSON and YAML always carry `subscription`). A wildcard skips disabled
+subscriptions, and one that fails to scan is reported and left out, so the
+rest of the run carries on. At the subscription prompt, `*` or several
+numbers pick more than one.
+
+VM and NIC tables show each public IP's address and its resource name
+(PUBLIC IP NAME). An attached public IP with no address yet reads
+`(unassigned)`, with its name still shown.
 
 Filters: different flags AND together, a repeated flag ORs, and names take
 wildcards, case-insensitively. Each VM and NIC carries both NSG layers — the one

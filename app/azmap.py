@@ -8,9 +8,10 @@
 Authentication is the app's own: DefaultAzureCredential, through azure_ingest,
 so whatever identity the web app resolves on this host, the CLI resolves too.
 
-Filtering runs in the app's two stages. The subscription is scanned once, then
+Filtering runs in the app's two stages. Each subscription is scanned once, then
 resource groups are picked from what that scan found, locally. Leave out --sub
 or --rg on a terminal and the CLI asks for them, listing the choices.
+--sub '*' scans every subscription the identity can see.
 
 NSG rule filters (--port, --from, ...) match rules as written. They answer
 "which rules allow this?", not "is this reachable?" — a higher-priority deny,
@@ -72,13 +73,14 @@ def matches_any(value: Optional[str], patterns: Iterable[str]) -> bool:
 
 # ----------------------------------------------------------------- scan ---
 
-def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any]:
+def scan(ingestor: AzureResourceIngestor, subscription: Dict[str, Any]) -> Dict[str, Any]:
     """Fetch and join VMs, NICs, subnets, NSGs and route tables for one subscription.
 
     Every NIC and VM comes back with the NSGs that apply to it, by layer: the
     NSG on the NIC itself, and the NSG on each subnet it sits in. Traffic has
     to pass both, so both are listed.
     """
+    subscription_id = subscription["id"]
     public_ips = ingestor.get_public_ips(subscription_id)
     compute = ingestor.get_nics_and_vms(subscription_id, public_ips)
     vnets = ingestor.get_vnets_and_subnets(subscription_id)
@@ -117,12 +119,15 @@ def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any
             "vm_name": record["vm_name"],
             "private_ips": [],
             "public_ips": [],
+            "public_ip_names": [],
             "subnet_ids": [],
         })
         if record["private_ip"]:
             nic["private_ips"].append(record["private_ip"])
         if record["public_ip"]:
             nic["public_ips"].append(record["public_ip"])
+        if record.get("public_ip_name"):
+            nic["public_ip_names"].append(record["public_ip_name"])
         if record["subnet_id"] not in nic["subnet_ids"]:
             nic["subnet_ids"].append(record["subnet_id"])
 
@@ -187,6 +192,12 @@ def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any
                 "route_table_id": rt_id,
             })
 
+    # Every object says which subscription it came from, for runs that
+    # scan more than one.
+    for obj in [*vms, *nics.values(), *nsgs, *subnets]:
+        obj["subscription"] = subscription["name"]
+        obj["subscription_id"] = subscription_id
+
     by_name = lambda o: (o["resource_group"].lower(), o["name"].lower())
     return {
         "vms": sorted(vms, key=by_name),
@@ -201,9 +212,20 @@ def scan(ingestor: AzureResourceIngestor, subscription_id: str) -> Dict[str, Any
 
 # ------------------------------------------------------ stage 1: the sub ---
 
-def choose_subscription(
-    ingestor: AzureResourceIngestor, wanted: Optional[str]
-) -> Dict[str, Any]:
+def enabled(sub: Dict[str, Any]) -> bool:
+    return str(sub["state"]).lower().endswith("enabled")
+
+
+def choose_subscriptions(
+    ingestor: AzureResourceIngestor, wanted: Optional[List[str]]
+) -> List[Dict[str, Any]]:
+    """The subscriptions to scan.
+
+    ``--sub`` takes a name or ID, wildcards allowed, and repeats; ``'*'`` is
+    every subscription this identity can see. A wildcard skips disabled
+    subscriptions, which refuse reads; a subscription named outright is
+    scanned whatever its state, so its error is the one you asked for.
+    """
     subscriptions = sorted(
         ingestor.get_subscriptions(), key=lambda s: (s["name"] or "").lower()
     )
@@ -212,34 +234,111 @@ def choose_subscription(
             "This identity can see no subscriptions. It authenticated, so it "
             "most likely lacks the Reader role."
         )
+    listing = "\n".join(f"  {s['name']}  ({s['id']})" for s in subscriptions)
+
+    def pick(tokens: List[str]) -> List[Dict[str, Any]]:
+        chosen, bad, skipped = [], [], []
+        for token in tokens:
+            exact = [s for s in subscriptions
+                     if token.lower() in (s["id"].lower(), (s["name"] or "").lower())]
+            globbed = [
+                s for s in subscriptions
+                if matches_any(s["name"], [token]) or matches_any(s["id"], [token])
+            ]
+            found = exact or [s for s in globbed if enabled(s)]
+            if not exact:
+                for s in globbed:
+                    if not enabled(s) and s["name"] not in skipped:
+                        skipped.append(s["name"])
+            if not found:
+                bad.append(token)
+            chosen += [s for s in found if s not in chosen]
+        if bad:
+            raise ValueError(", ".join(bad))
+        if skipped:
+            note(f"Skipping disabled subscription(s): {', '.join(skipped)} (name one with --sub to try it)")
+        return chosen
 
     if wanted:
-        for sub in subscriptions:
-            if wanted.lower() in (sub["id"].lower(), (sub["name"] or "").lower()):
-                return sub
-        listing = "\n".join(f"  {s['name']}  ({s['id']})" for s in subscriptions)
-        raise SystemExit(f"No subscription matches '{wanted}'. Available:\n{listing}")
+        try:
+            return pick(wanted)
+        except ValueError as e:
+            raise SystemExit(f"No subscription matches '{e}'. Available:\n{listing}")
 
     if len(subscriptions) == 1:
         note(f"Subscription: {subscriptions[0]['name']} (the only one visible)")
-        return subscriptions[0]
+        return subscriptions
 
     if not interactive():
-        listing = "\n".join(f"  {s['name']}  ({s['id']})" for s in subscriptions)
-        raise SystemExit(f"Pass --sub; this identity sees several:\n{listing}")
+        raise SystemExit(f"Pass --sub (or --sub '*' for all); this identity sees several:\n{listing}")
 
     note("Subscriptions:")
     for i, sub in enumerate(subscriptions, 1):
-        state = "" if str(sub["state"]).endswith(("Enabled", "ENABLED")) else f"  [{sub['state']}]"
+        state = "" if enabled(sub) else f"  [{sub['state']}]"
         note(f"  {i:>3}) {sub['name']}  ({sub['id']}){state}")
     while True:
-        answer = ask("Pick a subscription (number or name): ")
-        if answer.isdigit() and 1 <= int(answer) <= len(subscriptions):
-            return subscriptions[int(answer) - 1]
-        for sub in subscriptions:
-            if answer.lower() in (sub["id"].lower(), (sub["name"] or "").lower()):
-                return sub
-        note(f"  '{answer}' isn't one of those.")
+        answer = ask("Pick subscriptions (numbers or names, comma-separated; * for all): ")
+        tokens = [
+            subscriptions[int(t) - 1]["id"] if t.isdigit() and 1 <= int(t) <= len(subscriptions) else t
+            for t in answer.replace(",", " ").split()
+        ]
+        if not tokens:
+            continue
+        try:
+            return pick(tokens)
+        except ValueError as e:
+            note(f"  Not in the list: {e}")
+
+
+def scan_all(ingestor: AzureResourceIngestor, subscriptions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Scan each subscription, in parallel, into one inventory.
+
+    A subscription that fails (no access, a provider not registered) is
+    reported and left out, so one bad subscription doesn't sink a run over
+    all of them.
+    """
+    if len(subscriptions) == 1:
+        note(f"Scanning {subscriptions[0]['name']}...")
+        return scan(ingestor, subscriptions[0])
+
+    note(f"Scanning {len(subscriptions)} subscriptions...")
+
+    def one(sub):
+        try:
+            return scan(ingestor, sub)
+        except HttpResponseError as e:
+            note(f"  Skipped {sub['name']}: {(e.message or str(e)).splitlines()[0]}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        inventories = [i for i in pool.map(one, subscriptions) if i]
+    if not inventories:
+        raise SystemExit("Every subscription failed to scan.")
+
+    merged: Dict[str, Any] = {"subnet_names": {}}
+    for kind in ("vms", "nics", "nsgs", "subnets"):
+        merged[kind] = sorted(
+            (o for inv in inventories for o in inv[kind]),
+            key=lambda o: (o["subscription"].lower(), o["resource_group"].lower(),
+                           o.get("vnet", "").lower(), o["name"].lower()),
+        )
+    for inv in inventories:
+        merged["subnet_names"].update(inv["subnet_names"])
+    return merged
+
+
+def sub_head(args) -> List[str]:
+    """A leading SUBSCRIPTION column, when the run spans more than one."""
+    return ["SUBSCRIPTION"] if args.multi_sub else []
+
+
+def sub_cols(obj: Dict[str, Any], args) -> List[str]:
+    return [obj["subscription"]] if args.multi_sub else []
+
+
+def where(obj: Dict[str, Any], args) -> str:
+    """Where an object lives, for section headings: its group, and sub if several."""
+    return f"{obj['subscription']} / {obj['resource_group']}" if args.multi_sub else obj["resource_group"]
 
 
 # --------------------------------------------- stage 2: resource groups ---
@@ -617,6 +716,7 @@ def object_row(obj: Dict[str, Any], kind: str) -> List[str]:
             obj["os_type"] or "",
             " ".join(ip for n in nics for ip in n["private_ips"]),
             " ".join(ip for n in nics for ip in n["public_ips"]),
+            " ".join(p for n in nics for p in n["public_ip_names"]),
             " ".join(s for n in nics for s in n["subnets"]),
             nsg_cell(obj["layers"]),
         ]
@@ -626,14 +726,17 @@ def object_row(obj: Dict[str, Any], kind: str) -> List[str]:
         obj["vm_name"] or "(unattached)",
         " ".join(obj["private_ips"]),
         " ".join(obj["public_ips"]),
+        " ".join(obj["public_ip_names"]),
         " ".join(obj["subnets"]),
         nsg_cell(obj["layers"]),
     ]
 
 
 OBJECT_HEADERS = {
-    "vms": ["NAME", "RESOURCE GROUP", "SIZE", "OS", "PRIVATE IP", "PUBLIC IP", "SUBNET", "NSG"],
-    "nics": ["NAME", "RESOURCE GROUP", "VM", "PRIVATE IP", "PUBLIC IP", "SUBNET", "NSG"],
+    "vms": ["NAME", "RESOURCE GROUP", "SIZE", "OS", "PRIVATE IP", "PUBLIC IP", "PUBLIC IP NAME",
+            "SUBNET", "NSG"],
+    "nics": ["NAME", "RESOURCE GROUP", "VM", "PRIVATE IP", "PUBLIC IP", "PUBLIC IP NAME",
+             "SUBNET", "NSG"],
     "subnets": ["VNET", "SUBNET", "RESOURCE GROUP", "PREFIX", "NSG", "ROUTE TABLE"],
 }
 
@@ -713,9 +816,11 @@ def render_effective_table(vms: List[Dict[str, Any]], args) -> None:
     for i, vm in enumerate(vms):
         if i:
             print()
-        print(f"{vm['name']}  ({vm['resource_group']})  [{vm['power_state']}]")
+        print(f"{vm['name']}  ({where(vm, args)})  [{vm['power_state']}]")
         for nic in vm["nics"]:
             public = f"  public {' '.join(nic['public_ips'])}" if nic["public_ips"] else ""
+            if nic["public_ip_names"]:
+                public += f" ({' '.join(nic['public_ip_names'])})"
             print(f"  NIC {nic['name']}  on {' '.join(nic['subnets'])}"
                   f"  {' '.join(nic['private_ips'])}{public}")
             if "effective_error" in nic:
@@ -759,7 +864,7 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
         for i, nsg in enumerate(objects):
             if i:
                 print()
-            print(f"{nsg['name']}  ({nsg['resource_group']}, {nsg['location']})")
+            print(f"{nsg['name']}  ({where(nsg, args)}, {nsg['location']})")
             if not nsg["subnets"] and not nsg["nics"]:
                 print("  attached to nothing")
             print_list("subnets", nsg["subnets"])
@@ -770,13 +875,14 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
             print_rules_by_direction(nsg, args, "  ")
         return
 
-    print_table(OBJECT_HEADERS[kind], [object_row(o, kind) for o in objects])
+    print_table(sub_head(args) + OBJECT_HEADERS[kind],
+                [sub_cols(o, args) + object_row(o, kind) for o in objects])
     if kind == "subnets":
         if not (args.show_rules or args.show_routes):
             return
         for subnet in objects:
             print()
-            print(f"{subnet['path']}  ({subnet['resource_group']}, {' '.join(subnet['address_prefixes'])})")
+            print(f"{subnet['path']}  ({where(subnet, args)}, {' '.join(subnet['address_prefixes'])})")
             if args.show_routes:
                 print_routes(subnet, "  ")
             if args.show_rules:
@@ -790,7 +896,7 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
         return
     for obj in objects:
         print()
-        print(f"{obj['name']}  ({obj['resource_group']})")
+        print(f"{obj['name']}  ({where(obj, args)})")
         if not obj["layers"]:
             print("  no NSG on the NIC or the subnet")
         for layer in obj["layers"]:
@@ -845,6 +951,7 @@ def nic_json(nic: Dict[str, Any], args) -> Dict[str, Any]:
         "vm": nic["vm_name"],
         "private_ips": nic["private_ips"],
         "public_ips": nic["public_ips"],
+        "public_ip_names": nic["public_ip_names"],
         "subnets": nic["subnets"],
         "nsgs": layers_json(nic["layers"], args),
     }
@@ -926,7 +1033,18 @@ def structured(objects: List[Dict[str, Any]], args, kind: str) -> List[Dict[str,
             ],
             "nsgs": layers_json(vm["layers"], args),
         } for vm in objects]
-    return data
+    # Name the subscription beside the resource group, always: a file is
+    # often merged with others later, and it costs one line per object.
+    return [_with_subscription(d, o) for d, o in zip(data, objects)]
+
+
+def _with_subscription(entry: Dict[str, Any], obj: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, value in entry.items():
+        out[key] = value
+        if key == "resource_group":
+            out["subscription"] = obj["subscription"]
+    return out
 
 
 def render_json(objects: List[Dict[str, Any]], args, kind: str) -> None:
@@ -1013,52 +1131,55 @@ def render_yaml(objects: List[Dict[str, Any]], args, kind: str) -> None:
 def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
     """One row per object, or with rules in play, one row per rule."""
     writer = csv.writer(sys.stdout)
+
+    def head(cells: List[str]) -> None:
+        writer.writerow(sub_head(args) + cells)
+
+    def row(obj: Dict[str, Any], cells: List[str]) -> None:
+        writer.writerow(sub_cols(obj, args) + cells)
+
     if args.effective:
-        writer.writerow(["VM", "RESOURCE GROUP", "NIC", "PUBLIC IP", "LAYER", "NSG"] + RULE_HEADERS)
+        head(["VM", "RESOURCE GROUP", "NIC", "PUBLIC IP", "PUBLIC IP NAME", "LAYER", "NSG"] + RULE_HEADERS)
         for vm in objects:
             for nic in vm["nics"]:
                 if "effective_error" in nic:
                     note(f"{vm['name']}/{nic['name']}: {nic['effective_error']}")
                 for r in effective_rows(nic.get("effective", []), args):
-                    writer.writerow(
-                        [vm["name"], vm["resource_group"], nic["name"],
-                         " ".join(nic["public_ips"]), r["layer"], r["nsg"]]
-                        + rule_row(r["rule"])
-                    )
+                    row(vm, [vm["name"], vm["resource_group"], nic["name"],
+                             " ".join(nic["public_ips"]), " ".join(nic["public_ip_names"]),
+                             r["layer"], r["nsg"]] + rule_row(r["rule"]))
         return
     if kind == "nsgs":
-        writer.writerow(["NSG", "RESOURCE GROUP"] + RULE_HEADERS)
+        head(["NSG", "RESOURCE GROUP"] + RULE_HEADERS)
         for nsg in objects:
             for rule in shown_rules(nsg, args):
-                writer.writerow([nsg["name"], nsg["resource_group"]] + rule_row(rule))
+                row(nsg, [nsg["name"], nsg["resource_group"]] + rule_row(rule))
         return
 
     if kind == "subnets" and args.show_routes:
         # Every subnet gets at least one row, so one without a UDR is
         # still in the sheet rather than silently missing from it.
-        writer.writerow(OBJECT_HEADERS[kind] + ROUTE_HEADERS)
+        head(OBJECT_HEADERS[kind] + ROUTE_HEADERS)
         for subnet in objects:
-            row = object_row(subnet, kind)
-            row[-1] = route_table_name(subnet) or ""
+            cells = object_row(subnet, kind)
+            cells[-1] = route_table_name(subnet) or ""
             routes = (subnet["route_table"] or {}).get("routes") or [None]
             for route in routes:
-                writer.writerow(row + (route_row(route) if route else [""] * len(ROUTE_HEADERS)))
+                row(subnet, cells + (route_row(route) if route else [""] * len(ROUTE_HEADERS)))
         return
 
     if not args.show_rules:
-        writer.writerow(OBJECT_HEADERS[kind])
+        head(OBJECT_HEADERS[kind])
         for obj in objects:
-            writer.writerow(object_row(obj, kind))
+            row(obj, object_row(obj, kind))
         return
 
-    writer.writerow([kind[:-1].upper(), "RESOURCE GROUP", "LAYER", "NSG"] + RULE_HEADERS)
+    head([kind[:-1].upper(), "RESOURCE GROUP", "LAYER", "NSG"] + RULE_HEADERS)
     for obj in objects:
         for layer in obj["layers"]:
             for rule in shown_rules(layer["nsg"], args):
-                writer.writerow(
-                    [obj.get("path", obj["name"]), obj["resource_group"], layer["layer"], layer["nsg"]["name"]]
-                    + rule_row(rule)
-                )
+                row(obj, [obj.get("path", obj["name"]), obj["resource_group"],
+                          layer["layer"], layer["nsg"]["name"]] + rule_row(rule))
 
 
 # ------------------------------------------------------------------ main ---
@@ -1069,7 +1190,10 @@ NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs", "subnets": "subnets"}
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     scope = common.add_argument_group("scope (asked for when left out)")
-    scope.add_argument("--sub", metavar="SUB", help="subscription name or ID")
+    scope.add_argument(
+        "--sub", metavar="SUB", action="append",
+        help="subscription name or ID; repeatable, wildcards allowed, '*' for all",
+    )
     scope.add_argument(
         "--rg", metavar="RG", action="append",
         help="resource group; repeatable, wildcards allowed, '*' for all",
@@ -1173,22 +1297,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(level=logging.WARNING)
 
     ingestor = AzureResourceIngestor()
-    sub = choose_subscription(ingestor, args.sub)
-    note(f"Scanning {sub['name']}...")
-    inventory = scan(ingestor, sub["id"])
+    subs = choose_subscriptions(ingestor, args.sub)
+    args.multi_sub = len(subs) > 1
+    inventory = scan_all(ingestor, subs)
 
     objects = inventory[kind]
     args.rg_patterns = choose_resource_groups(objects, NOUNS[kind], args.rg)
 
     if _prompted:
         rgs = " ".join(f"--rg '{g}'" for g in args.rg_patterns or ["*"])
-        note(f"Next time, skip the questions with: --sub '{sub['name']}' {rgs}")
+        names = " ".join(f"--sub '{s['name']}'" for s in subs)
+        note(f"Next time, skip the questions with: {names} {rgs}")
     note()
 
     args.effective = getattr(args, "effective", False)
     selected = [o for o in objects if keep(o, args, kind, not args.effective)]
     if args.effective:
-        fetch_effective(ingestor, sub["id"], selected, inventory["subnet_names"])
+        by_sub: Dict[str, List[Dict[str, Any]]] = {}
+        for vm in selected:
+            by_sub.setdefault(vm["subscription_id"], []).append(vm)
+        for sub_id, vms_here in by_sub.items():
+            fetch_effective(ingestor, sub_id, vms_here, inventory["subnet_names"])
         if rule_filter_active(args):
             unknown = [v["name"] for v in selected if any("effective_error" in n for n in v["nics"])]
             selected = [v for v in selected if effective_match(v, args)]
