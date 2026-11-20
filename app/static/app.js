@@ -31,6 +31,14 @@ let totalVmCount = 0;
 let allResourceGroups = [];
 let selectedResourceGroups = new Set();
 
+// Subscription picker state, the same shape as the RG filter: every
+// subscription the identity can see, and the ones ticked for the next scan.
+let allSubscriptions = [];
+let selectedSubscriptions = new Set();
+// What the current diagram was scanned from, for the title and file names.
+let scannedSubscriptions = [];
+const SUB_CHOICE_KEY = 'azureMapper.subscriptions';
+
 /**
  * Ask the backend which Azure identity it resolved.
  *
@@ -105,7 +113,28 @@ function topologyStyles() {
                     'text-halign': 'center',
                 }
             },
-            // Resource group: outermost rounded rectangle
+            // Subscription: outermost box, present when the diagram spans
+            // more than one subscription or reaches outside the one scanned.
+            {
+                selector: 'node[type="subscription"]',
+                style: {
+                    'shape': 'roundrectangle',
+                    'background-color': '#fbfaf5',
+                    'border-color': '#5c5c5c',
+                    'border-width': 3,
+                    'border-style': 'solid',
+                    'text-valign': 'top',
+                    'text-halign': 'center',
+                    'text-margin-y': -10,
+                    'font-size': 15,
+                    'font-weight': 'bold',
+                    'color': '#333',
+                    'padding': '40px',
+                    'background-opacity': 0.6,
+                    'text-wrap': 'wrap',
+                }
+            },
+            // Resource group: rounded rectangle inside the subscription
             {
                 selector: 'node[type="resource_group"]',
                 style: {
@@ -143,6 +172,33 @@ function topologyStyles() {
                     'background-opacity': 0.4,
                     'text-wrap': 'wrap',
                     'text-max-width': '200px',
+                }
+            },
+            // Not scanned: a subscription, resource group or VNet drawn only
+            // because a peering reaches it. Grey and dotted, so it doesn't
+            // read as something whose contents you're seeing.
+            {
+                selector: 'node[type="subscription"][?external], node[type="resource_group"][?external]',
+                style: {
+                    'border-style': 'dotted',
+                    'border-color': '#9a9a9a',
+                    'background-color': '#f7f7f7',
+                    'color': '#888',
+                }
+            },
+            {
+                selector: 'node[type="vnet"][?external]',
+                style: {
+                    'width': 190,
+                    'height': 64,
+                    'text-valign': 'center',
+                    'text-margin-y': 0,
+                    'font-weight': 'normal',
+                    'border-style': 'dotted',
+                    'border-color': '#7a8a99',
+                    'background-color': '#eef1f4',
+                    'background-opacity': 1,
+                    'color': '#4a5a6a',
                 }
             },
             // Subnet: solid rounded rectangle inside VNet
@@ -223,7 +279,7 @@ function topologyStyles() {
                     'target-arrow-shape': 'triangle',
                     'line-style': 'dashed',
                     'width': 2,
-                    'label': 'peering',
+                    'label': 'data(label)',
                     'font-size': 8,
                     'color': '#107c10',
                     'text-rotation': 'autorotate',
@@ -237,6 +293,18 @@ function topologyStyles() {
                     'source-arrow-color': '#107c10',
                 }
             },
+            // Both sides exist but it isn't passing traffic as configured:
+            // Disconnected, still Initiated, or out of sync with an address
+            // space change. Amber, below one-way's red.
+            {
+                selector: 'edge[type="peered_to"][?degraded]',
+                style: {
+                    'line-color': '#c77700',
+                    'target-arrow-color': '#c77700',
+                    'source-arrow-color': '#c77700',
+                    'color': '#c77700',
+                }
+            },
             // One-way peering — only one direction exists. Flag it in red.
             {
                 selector: 'edge[type="peered_to"][!bidirectional]',
@@ -244,7 +312,15 @@ function topologyStyles() {
                     'line-color': '#d13438',
                     'target-arrow-color': '#d13438',
                     'color': '#d13438',
-                    'label': '1-way peering',
+                }
+            },
+            // Crossing subscriptions: heavier, so the links that tie the
+            // boxes together stand out from peerings within one.
+            {
+                selector: 'edge[type="peered_to"][?cross_subscription]',
+                style: {
+                    'width': 3,
+                    'font-weight': 'bold',
                 }
             },
             // NIC nodes
@@ -436,11 +512,14 @@ function showStatus(elementId, message, type = 'info') {
 }
 
 /**
- * Load available subscriptions
+ * Load available subscriptions into the picker.
+ *
+ * Whatever was ticked last time is ticked again (when it still exists), so a
+ * multi-subscription view doesn't have to be rebuilt by hand on every visit.
  */
 async function loadSubscriptions() {
-    const select = document.getElementById('subscriptionSelect');
-    select.innerHTML = '<option value="">-- Loading… --</option>';
+    const list = document.getElementById('subList');
+    list.innerHTML = '<div class="rg-empty">Loading…</div>';
     showStatus('subStatus', 'Loading subscriptions...', 'loading');
     try {
         const res = await fetch('/api/subscriptions');
@@ -450,41 +529,133 @@ async function loadSubscriptions() {
             throw new Error(data.error || 'Failed to load subscriptions');
         }
 
-        select.innerHTML = '<option value="">-- Select subscription --</option>';
+        allSubscriptions = data.subscriptions
+            .map(function(sub) {
+                return {
+                    id: sub.id,
+                    name: sub.name,
+                    state: String(sub.state || '').split('.').pop(),
+                };
+            })
+            .sort(function(a, b) { return a.name.localeCompare(b.name); });
 
-        data.subscriptions.forEach(sub => {
-            const option = document.createElement('option');
-            option.value = sub.id;
-            option.textContent = `${sub.name} (${sub.state})`;
-            select.appendChild(option);
-        });
+        let remembered = [];
+        try {
+            remembered = JSON.parse(localStorage.getItem(SUB_CHOICE_KEY) || '[]');
+        } catch (e) { remembered = []; }
+        const known = new Set(allSubscriptions.map(function(s) { return s.id; }));
+        selectedSubscriptions = new Set(remembered.filter(function(id) { return known.has(id); }));
+        if (selectedSubscriptions.size === 0 && allSubscriptions.length === 1) {
+            selectedSubscriptions.add(allSubscriptions[0].id);
+        }
 
-        showStatus('subStatus', `Loaded ${data.subscriptions.length} subscriptions`, 'success');
+        document.getElementById('subSearch').value = '';
+        renderSubscriptionList();
+        showStatus('subStatus', `Loaded ${allSubscriptions.length} subscriptions`, 'success');
     } catch (e) {
-        select.innerHTML = '<option value="">-- Unavailable --</option>';
+        list.innerHTML = '<div class="rg-empty">Unavailable</div>';
         showStatus('subStatus', `Error: ${e.message} — fix the credential and reload`, 'error');
     }
 }
 
+function isEnabled(sub) {
+    return sub.state.toLowerCase() === 'enabled';
+}
+
 /**
- * Scan the selected subscription
+ * The subscriptions the picker is showing: all, or those matching the search.
+ */
+function listedSubscriptions() {
+    const query = document.getElementById('subSearch').value.trim().toLowerCase();
+    if (!query) return allSubscriptions;
+    return allSubscriptions.filter(function(sub) {
+        return sub.name.toLowerCase().includes(query) || sub.id.toLowerCase().includes(query);
+    });
+}
+
+function renderSubscriptionList() {
+    const list = document.getElementById('subList');
+    const shown = listedSubscriptions();
+    list.innerHTML = '';
+
+    if (shown.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'rg-empty';
+        empty.textContent = allSubscriptions.length ? 'No subscriptions match' : 'No subscriptions visible';
+        list.appendChild(empty);
+    }
+    shown.forEach(function(sub) {
+        const label = document.createElement('label');
+        label.className = 'rg-item' + (isEnabled(sub) ? '' : ' disabled-sub');
+        label.title = `${sub.name}\n${sub.id}\n${sub.state}`;
+
+        const box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = selectedSubscriptions.has(sub.id);
+        box.addEventListener('change', function() {
+            if (box.checked) selectedSubscriptions.add(sub.id);
+            else selectedSubscriptions.delete(sub.id);
+            updateSubscriptionCount();
+        });
+
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(
+            isEnabled(sub) ? sub.name : `${sub.name} (${sub.state})`
+        ));
+        list.appendChild(label);
+    });
+    updateSubscriptionCount();
+}
+
+/**
+ * Select-all / clear over what the list is showing. Select-all skips disabled
+ * subscriptions, which can't be scanned; tick one by hand to try anyway.
+ */
+function setListedSubscriptions(selected) {
+    listedSubscriptions().forEach(function(sub) {
+        if (!selected) selectedSubscriptions.delete(sub.id);
+        else if (isEnabled(sub)) selectedSubscriptions.add(sub.id);
+    });
+    renderSubscriptionList();
+}
+
+function updateSubscriptionCount() {
+    const n = selectedSubscriptions.size;
+    document.getElementById('scanBtn').textContent =
+        n > 1 ? `Scan ${n} Subscriptions` : 'Scan Resources';
+}
+
+function subscriptionName(id) {
+    const sub = allSubscriptions.find(function(s) { return s.id === id; });
+    return sub ? sub.name : id;
+}
+
+/**
+ * Scan the ticked subscriptions into one diagram.
  */
 async function scanSubscription() {
-    const subscriptionId = document.getElementById('subscriptionSelect').value;
-    if (!subscriptionId) {
-        showStatus('scanStatus', 'Please select a subscription', 'error');
+    const ids = allSubscriptions
+        .filter(function(s) { return selectedSubscriptions.has(s.id); })
+        .map(function(s) { return s.id; });
+    if (ids.length === 0) {
+        showStatus('scanStatus', 'Tick at least one subscription', 'error');
         return;
     }
+    try {
+        localStorage.setItem(SUB_CHOICE_KEY, JSON.stringify(ids));
+    } catch (e) { /* private window: just don't remember */ }
 
     const scanBtn = document.getElementById('scanBtn');
     scanBtn.disabled = true;
-    showStatus('scanStatus', 'Scanning resources...', 'loading');
+    showStatus('scanStatus',
+        ids.length > 1 ? `Scanning ${ids.length} subscriptions...` : 'Scanning resources...',
+        'loading');
 
     try {
         const res = await fetch('/api/scan', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ subscription_id: subscriptionId })
+            body: JSON.stringify({ subscription_ids: ids })
         });
 
         const data = await res.json();
@@ -493,10 +664,15 @@ async function scanSubscription() {
             throw new Error(data.error || 'Scan failed');
         }
 
-        showStatus('scanStatus', `Scan complete: ${data.nodes_count} nodes, ${data.edges_count} edges`, 'success');
+        scannedSubscriptions = data.subscription_ids || ids;
+        let msg = `Scan complete: ${data.nodes_count} nodes, ${data.edges_count} edges`;
+        const skipped = data.skipped || [];
+        if (skipped.length > 0) {
+            msg += ` — skipped ${skipped.map(function(s) { return `${s.name} (${s.error})`; }).join('; ')}`;
+        }
+        showStatus('scanStatus', msg, skipped.length > 0 ? 'info' : 'success');
 
-        // Load the graph
-        await renderGraph(subscriptionId);
+        await renderGraph();
 
     } catch (e) {
         showStatus('scanStatus', `Scan error: ${e.message}`, 'error');
@@ -508,7 +684,7 @@ async function scanSubscription() {
 /**
  * Render the graph in Cytoscape
  */
-async function renderGraph(subscriptionId) {
+async function renderGraph() {
     try {
         initializeCytoscape();
 
@@ -533,13 +709,11 @@ async function renderGraph(subscriptionId) {
         populateResourceGroupFilter();
         applyResourceGroupFilter();
 
-        // Update title with subscription name
-        const subSelect = document.getElementById('subscriptionSelect');
-        const subName = subSelect.options[subSelect.selectedIndex].text;
-        document.getElementById('diagramTitle').textContent =
-            `Topology for ${subName}`;
-
-        document.getElementById('infoSub').textContent = subscriptionId;
+        const names = scannedSubscriptions.map(subscriptionName);
+        document.getElementById('diagramTitle').textContent = names.length > 1
+            ? `Topology for ${names.length} subscriptions`
+            : `Topology for ${names[0] || 'subscription'}`;
+        document.getElementById('infoSub').textContent = names.join(', ');
         document.getElementById('graphInfo').style.display = 'block';
         document.getElementById('limitSection').style.display = 'block';
         document.getElementById('exportSection').style.display = 'block';
@@ -562,24 +736,93 @@ async function renderGraph(subscriptionId) {
  * Each container is therefore measured after its contents land, so a subnet
  * holding twelve VMs pushes its neighbours along instead of overlapping them.
  */
-function layoutTopology(rgNodes) {
+function layoutTopology(topNodes) {
     const RG_GAP_X = 90, RG_GAP_Y = 90, RG_PAD = 45;
+    const SUB_GAP = 160, SUB_PAD = 60;
     const VNET_GAP = 45, VNET_PAD = 32;
     const SUBNET_GAP = 30, SUBNET_PAD = 24, SUBNET_TITLE_H = 38;
     const CARD_W = 185, CARD_H = 80, CARD_GAP = 16, SPANNING_VM_GAP = 60;
     const LB_H = 54, LB_ROW_GAP = 34;
 
-    const cols = Math.max(Math.ceil(Math.sqrt(rgNodes.length)), 1);
-    let cursorY = 0, idx = 0;
+    const subscriptions = topNodes.filter('[type="subscription"]');
+    if (subscriptions.length > 0) {
+        layoutSubscriptions(subscriptions);
+    } else {
+        layoutGrid(topNodes, 0, 0);
+    }
 
-    while (idx < rgNodes.length) {
-        let cursorX = 0, rowHeight = 0;
-        for (let c = 0; c < cols && idx < rgNodes.length; c++, idx++) {
-            const size = layoutResourceGroup(rgNodes[idx], cursorX, cursorY);
-            cursorX += size.w + RG_GAP_X;
-            rowHeight = Math.max(rowHeight, size.h);
+    /**
+     * Hub on top, everything else in rows beneath it.
+     *
+     * Most estates peer spokes to one hub. Laid out in a single row, the
+     * hub's peerings to far spokes cut straight through the boxes between;
+     * with the hub above, they fan down to each spoke instead. The hub is the
+     * subscription with the most peerings to other subscriptions. With none,
+     * subscriptions just sit in rows. Not-scanned subscriptions go last.
+     */
+    function layoutSubscriptions(subs) {
+        const degree = {};
+        cy.edges('[type="peered_to"]:visible').forEach(function(edge) {
+            const a = edge.source().ancestors('[type="subscription"]');
+            const b = edge.target().ancestors('[type="subscription"]');
+            if (a.length && b.length && a.id() !== b.id()) {
+                degree[a.id()] = (degree[a.id()] || 0) + 1;
+                degree[b.id()] = (degree[b.id()] || 0) + 1;
+            }
+        });
+        const ordered = subs.sort(function(a, b) {
+            const ext = (a.data('external') ? 1 : 0) - (b.data('external') ? 1 : 0);
+            if (ext !== 0) return ext;
+            return (degree[b.id()] || 0) - (degree[a.id()] || 0) ||
+                a.data('label').localeCompare(b.data('label'));
+        }).toArray();
+
+        let hub = null;
+        if (ordered.length > 2 && !ordered[0].data('external') && (degree[ordered[0].id()] || 0) > 1) {
+            hub = ordered.shift();
         }
-        cursorY += rowHeight + RG_GAP_Y;
+
+        let top = 0;
+        let hubSize = null;
+        if (hub) {
+            hubSize = layoutSubscription(hub, 0, 0);
+            top = hubSize.h + SUB_GAP;
+        }
+        const cols = ordered.length <= 6 ? ordered.length : Math.ceil(Math.sqrt(ordered.length));
+        let widest = 0, idx = 0;
+        while (idx < ordered.length) {
+            let x = 0, rowHeight = 0;
+            for (let c = 0; c < cols && idx < ordered.length; c++, idx++) {
+                const size = layoutSubscription(ordered[idx], x, top);
+                x += size.w + SUB_GAP;
+                rowHeight = Math.max(rowHeight, size.h);
+            }
+            widest = Math.max(widest, x - SUB_GAP);
+            top += rowHeight + SUB_GAP;
+        }
+        if (hub) {
+            // Centre the hub over the rows beneath it.
+            shiftBy(hub, Math.max((widest - hubSize.w) / 2, 0), 0);
+        }
+    }
+
+    function layoutGrid(rgNodes, x, y) {
+        const cols = Math.max(Math.ceil(Math.sqrt(rgNodes.length)), 1);
+        let cursorY = y, idx = 0;
+        while (idx < rgNodes.length) {
+            let cursorX = x, rowHeight = 0;
+            for (let c = 0; c < cols && idx < rgNodes.length; c++, idx++) {
+                const size = layoutResourceGroup(rgNodes[idx], cursorX, cursorY);
+                cursorX += size.w + RG_GAP_X;
+                rowHeight = Math.max(rowHeight, size.h);
+            }
+            cursorY += rowHeight + RG_GAP_Y;
+        }
+    }
+
+    function layoutSubscription(sub, x, y) {
+        layoutGrid(sub.children('[type="resource_group"]:visible'), x + SUB_PAD, y + SUB_PAD);
+        return alignAndMeasure(sub, x, y);
     }
 
     function layoutResourceGroup(rg, x, y) {
@@ -805,8 +1048,9 @@ function layoutTopology(rgNodes) {
  * Re-pack and re-fit whatever is currently visible.
  */
 function layoutVisible() {
-    const visibleRgs = cy.nodes('[type="resource_group"]:visible');
-    if (visibleRgs.length > 0) layoutTopology(visibleRgs);
+    const subs = cy.nodes('[type="subscription"]:visible');
+    const top = subs.length > 0 ? subs : cy.nodes('[type="resource_group"]:visible');
+    if (top.length > 0) layoutTopology(top);
 }
 
 /**
@@ -815,10 +1059,18 @@ function layoutVisible() {
  * Every RG starts selected, so a fresh scan looks the way it always has.
  */
 function populateResourceGroupFilter() {
+    // Keyed by node ID: with several subscriptions, two can each have an RG
+    // called "network". The subscription goes in the label to tell them apart.
+    const multi = cy.nodes('[type="subscription"]').length > 0;
     allResourceGroups = cy.nodes('[type="resource_group"]')
-        .map(function(rg) { return rg.data('label'); })
-        .sort(function(a, b) { return a.localeCompare(b); });
-    selectedResourceGroups = new Set(allResourceGroups);
+        .map(function(rg) {
+            let label = rg.data('label');
+            if (multi) label += ` · ${rg.data('subscription')}`;
+            if (rg.data('external')) label += ' (not scanned)';
+            return { id: rg.id(), label: label };
+        })
+        .sort(function(a, b) { return a.label.localeCompare(b.label); });
+    selectedResourceGroups = new Set(allResourceGroups.map(function(rg) { return rg.id; }));
 
     document.getElementById('rgSearch').value = '';
     document.getElementById('rgFilterSection').style.display =
@@ -846,25 +1098,25 @@ function renderResourceGroupList() {
         return;
     }
 
-    shown.forEach(function(name) {
+    shown.forEach(function(rg) {
         const label = document.createElement('label');
         label.className = 'rg-item';
-        label.title = name;
+        label.title = rg.label;
 
         const box = document.createElement('input');
         box.type = 'checkbox';
-        box.checked = selectedResourceGroups.has(name);
+        box.checked = selectedResourceGroups.has(rg.id);
         box.addEventListener('change', function() {
             if (box.checked) {
-                selectedResourceGroups.add(name);
+                selectedResourceGroups.add(rg.id);
             } else {
-                selectedResourceGroups.delete(name);
+                selectedResourceGroups.delete(rg.id);
             }
             applyResourceGroupFilter();
         });
 
         label.appendChild(box);
-        label.appendChild(document.createTextNode(name));
+        label.appendChild(document.createTextNode(rg.label));
         list.appendChild(label);
     });
 }
@@ -876,8 +1128,8 @@ function renderResourceGroupList() {
 function listedResourceGroups() {
     const query = document.getElementById('rgSearch').value.trim().toLowerCase();
     if (!query) return allResourceGroups;
-    return allResourceGroups.filter(function(name) {
-        return name.toLowerCase().includes(query);
+    return allResourceGroups.filter(function(rg) {
+        return rg.label.toLowerCase().includes(query);
     });
 }
 
@@ -886,11 +1138,11 @@ function listedResourceGroups() {
  * a search plus "Select All" is a quick way to isolate a family of RGs.
  */
 function setListedResourceGroups(selected) {
-    listedResourceGroups().forEach(function(name) {
+    listedResourceGroups().forEach(function(rg) {
         if (selected) {
-            selectedResourceGroups.add(name);
+            selectedResourceGroups.add(rg.id);
         } else {
-            selectedResourceGroups.delete(name);
+            selectedResourceGroups.delete(rg.id);
         }
     });
     renderResourceGroupList();
@@ -952,9 +1204,16 @@ function applyVisibility() {
     syncWorkloadCards();
 
     cy.nodes('[type="resource_group"]').forEach(function(rg) {
-        const visible = selectedResourceGroups.has(rg.data('label'));
+        const visible = selectedResourceGroups.has(rg.id());
         rg.style('display', visible ? 'element' : 'none');
         rg.descendants().style('display', visible ? 'element' : 'none');
+    });
+    // A subscription box shows while any of its resource groups does.
+    cy.nodes('[type="subscription"]').forEach(function(sub) {
+        const any = sub.children('[type="resource_group"]').some(function(rg) {
+            return selectedResourceGroups.has(rg.id());
+        });
+        sub.style('display', any ? 'element' : 'none');
     });
 }
 
@@ -1322,10 +1581,9 @@ function triggerDownload(filename, href) {
  * A filename stem naming what was scanned and when.
  */
 function exportBaseName() {
-    const select = document.getElementById('subscriptionSelect');
-    const chosen = select.selectedIndex > 0
-        ? select.options[select.selectedIndex].text.replace(/\s*\(.*\)\s*$/, '')
-        : 'azure';
+    const chosen = scannedSubscriptions.length > 1
+        ? `${scannedSubscriptions.length}-subscriptions`
+        : (scannedSubscriptions.length === 1 ? subscriptionName(scannedSubscriptions[0]) : 'azure');
     const slug = chosen.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
     return `azure-mapper-${slug || 'scan'}-${new Date().toISOString().slice(0, 10)}`;
 }

@@ -135,14 +135,18 @@ class AzureResourceIngestor:
         return subscriptions
 
     def get_vnets_and_subnets(self, subscription_id: str) -> Dict[str, Any]:
-        """Fetch all VNets and subnets for a given subscription."""
+        """Fetch all VNets and subnets for a given subscription.
+
+        Keyed by lowercased VNet ID, not name: two resource groups can each
+        hold a VNet called ``hub``, and keyed by name one would vanish.
+        """
         network_client = NetworkManagementClient(self.credential, subscription_id)
         vnets_data = {}
 
         # List all virtual networks
         for vnet in network_client.virtual_networks.list_all():
             rg_name = vnet.id.split("/")[4]
-            vnet_key = vnet.name
+            vnet_key = vnet.id.lower()
             vnets_data[vnet_key] = {
                 "id": vnet.id,
                 "name": vnet.name,
@@ -178,7 +182,13 @@ class AzureResourceIngestor:
         return vnets_data
 
     def get_vnet_peerings(self, subscription_id: str) -> List[Dict[str, Any]]:
-        """Fetch all VNet peerings for a given subscription."""
+        """Fetch all VNet peerings for a given subscription.
+
+        Each carries both ends by full ID, so a peering to a VNet in another
+        subscription can still be placed, plus the remote address space as
+        this side last synced it: enough to draw and describe a remote VNet
+        that wasn't scanned.
+        """
         network_client = NetworkManagementClient(self.credential, subscription_id)
         peerings = []
 
@@ -193,14 +203,25 @@ class AzureResourceIngestor:
                         rg_name, vnet.name
                     )
                     for peering in vnet_peerings:
+                        remote_space = getattr(peering, "remote_address_space", None)
                         peering_data = {
                             "id": peering.id,
                             "name": peering.name,
                             "source_vnet": vnet.name,
+                            "source_vnet_id": vnet.id,
+                            "source_resource_group": rg_name,
                             "remote_vnet_id": peering.remote_virtual_network.id if peering.remote_virtual_network else None,
+                            "remote_address_space": list(
+                                getattr(remote_space, "address_prefixes", None) or []
+                            ),
                             "allow_virtual_network_access": peering.allow_virtual_network_access,
                             "allow_forwarded_traffic": peering.allow_forwarded_traffic,
-                            "peering_state": peering.peering_state,
+                            "allow_gateway_transit": peering.allow_gateway_transit,
+                            "use_remote_gateways": peering.use_remote_gateways,
+                            "peering_state": self._enum_name(peering.peering_state),
+                            "peering_sync_level": self._enum_name(
+                                getattr(peering, "peering_sync_level", None)
+                            ),
                         }
                         peerings.append(peering_data)
                 except Exception as e:
@@ -795,12 +816,15 @@ class AzureResourceIngestor:
             })
         return groups
 
-    def scan_subscription(self, subscription_id: str) -> Dict[str, Any]:
+    def scan_subscription(
+        self, subscription_id: str, subscription_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Perform a full scan: VNets, subnets, peerings, NICs, VMs, and LBs."""
         public_ips = self.get_public_ips(subscription_id)
         compute = self.get_nics_and_vms(subscription_id, public_ips)
         return {
             "subscription_id": subscription_id,
+            "subscription_name": subscription_name or subscription_id,
             "vnets": self.get_vnets_and_subnets(subscription_id),
             "peerings": self.get_vnet_peerings(subscription_id),
             "nics": compute["nics"],

@@ -8,6 +8,7 @@ host identity, so bind it to localhost or a trusted network.
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 from flask import Flask, render_template, jsonify, request
@@ -29,6 +30,7 @@ app = Flask(__name__)
 # Global state (in-memory)
 current_graph = None
 current_subscription_id = None
+current_subscription_ids = []
 _ingestor = None
 
 
@@ -85,37 +87,70 @@ def get_subscriptions():
 
 @app.route("/api/scan", methods=["POST"])
 def scan_subscription():
-    """Trigger a resource scan for a subscription."""
-    global current_graph, current_subscription_id
+    """Scan one or more subscriptions into a single graph.
+
+    Takes ``subscription_ids`` (a list) or, as before, ``subscription_id``.
+    Subscriptions are scanned in parallel; one that fails is reported in
+    ``skipped`` and left out, so a single subscription without access
+    doesn't sink a scan of ten. Peerings between the scanned subscriptions
+    join their real VNets.
+    """
+    global current_graph, current_subscription_id, current_subscription_ids
 
     data = request.get_json() or {}
-    subscription_id = data.get("subscription_id")
+    ids = data.get("subscription_ids") or (
+        [data["subscription_id"]] if data.get("subscription_id") else []
+    )
+    ids = list(dict.fromkeys(i for i in ids if i))
+    if not ids:
+        return jsonify({"error": "subscription_ids required"}), 400
 
-    if not subscription_id:
-        return jsonify({"error": "subscription_id required"}), 400
+    ingestor = get_ingestor()
+    try:
+        # Names label each subscription's box, and name the subscription
+        # behind a peering to one that wasn't scanned.
+        names = {s["id"].lower(): s["name"] for s in ingestor.get_subscriptions()}
+    except Exception as e:
+        logger.warning(f"Couldn't list subscription names: {e}")
+        names = {}
+
+    def one(sub_id):
+        try:
+            return sub_id, ingestor.scan_subscription(sub_id, names.get(sub_id.lower())), None
+        except Exception as e:
+            logger.error(f"Error scanning subscription {sub_id}: {e}")
+            return sub_id, None, str(e).splitlines()[0] if str(e) else type(e).__name__
+
+    logger.info(f"Starting scan of {len(ids)} subscription(s)")
+    with ThreadPoolExecutor(max_workers=min(len(ids), 4)) as pool:
+        results = list(pool.map(one, ids))
+
+    scans = [scan for _, scan, _ in results if scan]
+    skipped = [
+        {"subscription_id": sub_id, "name": names.get(sub_id.lower(), sub_id), "error": err}
+        for sub_id, scan, err in results if not scan
+    ]
+    if not scans:
+        return jsonify({"error": "; ".join(f"{s['name']}: {s['error']}" for s in skipped)}), 500
 
     try:
-        logger.info(f"Starting scan for subscription: {subscription_id}")
-
-        # Fetch data from Azure
-        scan_data = get_ingestor().scan_subscription(subscription_id)
-
-        # Build graph
         current_graph = TopologyGraph()
-        current_graph.build_from_azure_scan(scan_data)
-        current_subscription_id = subscription_id
-
-        logger.info(f"Scan complete: {len(current_graph.nodes)} nodes, {len(current_graph.edges)} edges")
-
-        return jsonify({
-            "status": "success",
-            "subscription_id": subscription_id,
-            "nodes_count": len(current_graph.nodes),
-            "edges_count": len(current_graph.edges),
-        })
+        current_graph.build_from_azure_scans(scans, names)
     except Exception as e:
-        logger.error(f"Error scanning subscription: {e}")
+        logger.error(f"Error building graph: {e}")
         return jsonify({"error": str(e)}), 500
+    current_subscription_ids = [s["subscription_id"] for s in scans]
+    current_subscription_id = current_subscription_ids[0]
+
+    logger.info(f"Scan complete: {len(current_graph.nodes)} nodes, {len(current_graph.edges)} edges")
+    return jsonify({
+        "status": "success",
+        "subscription_id": current_subscription_id,
+        "subscription_ids": current_subscription_ids,
+        "skipped": skipped,
+        "nodes_count": len(current_graph.nodes),
+        "edges_count": len(current_graph.edges),
+    })
 
 
 @app.route("/api/graph", methods=["GET"])
@@ -128,6 +163,7 @@ def get_graph():
         cytoscape_data = current_graph.to_cytoscape_format()
         return jsonify({
             "subscription_id": current_subscription_id,
+            "subscription_ids": current_subscription_ids,
             "graph": cytoscape_data,
         })
     except Exception as e:
@@ -145,6 +181,7 @@ def get_graph_json():
         graph_data = current_graph.to_dict()
         return jsonify({
             "subscription_id": current_subscription_id,
+            "subscription_ids": current_subscription_ids,
             "graph": graph_data,
         })
     except Exception as e:
@@ -176,9 +213,10 @@ def get_subnet_resources():
 @app.route("/api/graph/clear", methods=["POST"])
 def clear_graph():
     """Clear the current graph."""
-    global current_graph, current_subscription_id
+    global current_graph, current_subscription_id, current_subscription_ids
     current_graph = None
     current_subscription_id = None
+    current_subscription_ids = []
     return jsonify({"status": "graph cleared"})
 
 

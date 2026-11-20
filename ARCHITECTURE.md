@@ -46,8 +46,8 @@
 │  │                                                                  │  │
 │  │  /api/identity       ──▶  describe_identity()                    │  │
 │  │  /api/subscriptions  ──▶  ingestor.get_subscriptions()           │  │
-│  │  /api/scan           ──▶  ingestor.scan_subscription()           │  │
-│  │                       ──▶  TopologyGraph.build_from_azure_scan() │  │
+│  │  /api/scan           ──▶  ingestor.scan_subscription() per sub   │  │
+│  │                       ──▶  TopologyGraph.build_from_azure_scans()│  │
 │  │  /api/graph          ──▶  TopologyGraph.to_cytoscape_format()    │  │
 │  │  /api/subnet/res.    ──▶  ingestor.get_subnet_resources()        │  │
 │  └──────────────────────────────────────────────────────────────────┘  │

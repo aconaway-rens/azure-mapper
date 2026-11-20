@@ -17,7 +17,23 @@ else; no topology data leaves the host it runs on.
   - Resource groups as outer containers
   - VNets nested inside with address space labels
   - Subnets nested inside VNets with CIDR labels
-  - Peering connections shown as dashed green edges (one-way peerings flagged in red)
+  - Peering connections shown as dashed green edges: one-way peerings in red,
+    Disconnected or out-of-sync ones in amber, cross-subscription ones bold
+- **Several subscriptions in one diagram** — tick as many subscriptions as you
+  like and scan them together. Each becomes a box holding its resource groups,
+  and peerings between them join the real VNets on either side. The
+  subscription with the most peerings to the others (usually the hub) is
+  drawn on top with the rest beneath, so its peerings fan out rather than
+  cutting through boxes. A subscription that fails to scan is skipped and
+  named in the status line; the rest still draw. The ticked set is remembered
+  in the browser for next time.
+- **Peerings that leave the scan still show** — a peering to a VNet in a
+  subscription you didn't scan (or can't read) ends at a dotted "not scanned"
+  placeholder named from the VNet's ID, carrying the address space the peering
+  reports, inside a box for its subscription. Its subscription is named when
+  this identity can see it. Only one side of such a peering can be read, so
+  Connected (which Azure reports only when both sides exist) is drawn as
+  healthy, and anything else as one-way.
 - **VMs and NICs in the diagram** — workloads are drawn inside their subnets,
   with size, OS, and private IPs on each card. Unattached NICs are drawn on
   their own, since an orphaned NIC is usually worth noticing.
@@ -54,7 +70,10 @@ else; no topology data leaves the host it runs on.
 - **Resource group filter** — tick one or more resource groups to narrow the
   diagram; the canvas re-packs around what's left, and the sidebar reports any
   peerings that now run off to a hidden resource group. Filtering is local to
-  the browser, so toggling groups never re-queries Azure.
+  the browser, so toggling groups never re-queries Azure. With several
+  subscriptions, each group is listed with its subscription, so two groups
+  called `rg-network` stay apart, and a subscription box hides along with its
+  last group.
 - **Export** — download the diagram as a PNG (matching what's on screen,
   filters and all) or the whole scan as JSON, including the contents of
   collapsed subnets. The running version is shown in the sidebar.
@@ -63,7 +82,7 @@ else; no topology data leaves the host it runs on.
 
 ## Command-line queries
 
-`app/azmap.py` answers questions about VMs, NICs, NSGs, subnets, VPN gateways and load balancers from the terminal,
+`app/azmap.py` answers questions about VMs, NICs, NSGs, subnets, peerings, VPN gateways and load balancers from the terminal,
 using the app's own credential — whatever identity the web app resolves on a
 host, the CLI resolves too. It needs nothing beyond `app/requirements.txt`.
 
@@ -76,6 +95,7 @@ python app/azmap.py subnets --sub Prod --rg '*' --routes
 python app/azmap.py vms  --sub Prod --rg '*' --port 3389 --from internet --access allow
 python app/azmap.py vms  --sub '*' --rg '*'    # every VM in every subscription
 python app/azmap.py lbs  --sub '*' --rg '*'    # every load balancer, internal and external
+python app/azmap.py peerings --sub '*' --rg '*' --problems   # broken or one-way peerings
 python app/azmap.py export --sub '*'           # everything, to one snapshot file
 python app/azmap.py gateways --file azmap-snapshot-20261119-1740.yaml --detail
 ```
@@ -111,6 +131,7 @@ the rule filters look at both.
 | `gateways` | `--type vpn\|expressroute`, `--detail` |
 | `local-gateways` | `--unused`, `--detail` |
 | `connections` | `--type`, `--status`, `--gateway`, `--remote`, `--detail` |
+| `peerings` | `--vnet`, `--remote`, `--state connected\|disconnected\|initiated`, `--cross-sub`, `--problems` |
 | `lbs` (or `load-balancers`) | `--type internal\|external\|gateway`, `--vm`, `--frontend`, `--unused`, `--port`, `--proto`, `--detail` |
 
 NSG rule filters, on any command: `--port`, `--from` (`internet`, an IP or
@@ -216,6 +237,24 @@ subscription's resource listing, then each is read individually, which is
 what returns a connection's live status; one that can't be read is listed as
 `(unreadable)` with the reason.
 
+### Peerings, across subscriptions
+
+```bash
+python app/azmap.py peerings --sub '*' --rg '*'                # every peering, both sides
+python app/azmap.py peerings --sub '*' --rg '*' --problems     # not Connected, out of sync, or one-way
+python app/azmap.py peerings --sub '*' --rg '*' --cross-sub    # only those leaving their subscription
+python app/azmap.py peerings --sub Prod --rg '*' --remote 'hub*'
+```
+
+One row per side of each peering: the VNet it's on, the remote VNet with its
+resource group, subscription and address space, state and sync level, the
+forwarded-traffic, gateway-transit and use-remote-gateways settings, and
+**OTHER SIDE**: `present` when the reverse peering was found (or the state is
+Connected, which Azure reports only when both sides exist), `missing` when
+the remote subscription was scanned and has no peering back, and
+`not scanned` when it wasn't, rather than a guess. Scan both subscriptions
+(`--sub '*'`) to check both sides of a cross-subscription peering.
+
 ### Load balancers, internal and external
 
 ```bash
@@ -259,7 +298,7 @@ python app/azmap.py connections --file prod.yaml -o csv --out tunnels.csv
 
 `export` saves everything azmap reads — VMs, NICs, public IPs, VNets and
 subnets, NSGs with their rules, route tables, gateways, local gateways,
-connections and load balancers — for each subscription into one YAML file, with when it was
+connections, load balancers and peerings — for each subscription into one YAML file, with when it was
 taken and by which version. `--file` on any command reads that file instead
 of Azure: the same tables, filters, `--detail` and output formats, with no
 credential needed, so it works when Azure doesn't. It covers every
@@ -273,8 +312,8 @@ Keep these as the record to rebuild from. Things to know:
   with `--file`; `--rules` shows the rules as written, which is what you'd
   rebuild anyway.
 - **Re-export after upgrading.** A snapshot holds what its version of azmap
-  recorded; one taken before load balancers were added (v1.13.0) says so
-  rather than showing none.
+  recorded; one taken before load balancers (v1.13.0) or peerings (v1.14.0)
+  were added says so rather than showing none.
 - **Diffable.** Gateway and load balancer settings are written in sorted order, so two
   snapshots of an unchanged environment diff clean.
 - **Only export files read back.** A file from `-o yaml` is a report shaped
@@ -455,7 +494,7 @@ every source it tried and why each failed. Common causes:
 ├── app/
 │   ├── app.py              # Flask backend
 │   ├── azure_ingest.py     # Azure SDK resource discovery + credential handling
-│   ├── azmap.py            # CLI: VMs, NICs, NSGs, subnets, VPN, LBs; export/--file snapshots
+│   ├── azmap.py            # CLI: VMs, NICs, NSGs, subnets, peerings, VPN, LBs; snapshots
 │   ├── graph_builder.py    # Topology graph model
 │   ├── requirements.txt
 │   ├── static/

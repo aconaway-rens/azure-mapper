@@ -6,6 +6,7 @@
     python app/azmap.py subnets [--sub SUB] [--rg RG ...] [filters]
     python app/azmap.py gateways | local-gateways | connections [--detail]
     python app/azmap.py lbs [--type internal|external] [--detail]
+    python app/azmap.py peerings [--cross-sub] [--problems]
     python app/azmap.py export [--sub '*']      then any command with --file
 
 Authentication is the app's own: DefaultAzureCredential, through azure_ingest,
@@ -91,6 +92,8 @@ def scan(ingestor: AzureResourceIngestor, subscription: Dict[str, Any], kind: st
         return scan_vpn(ingestor, subscription)
     if kind == "lbs":
         return scan_lbs(ingestor, subscription)
+    if kind == "peerings":
+        return scan_peerings(ingestor, subscription)
     subscription_id = subscription["id"]
     public_ips = ingestor.get_public_ips(subscription_id)
     compute = ingestor.get_nics_and_vms(subscription_id, public_ips)
@@ -314,6 +317,7 @@ def scan_all(
     if len(subscriptions) == 1:
         note(f"{verb} {subscriptions[0]['name']}...")
         inventories = [scan(ingestor, subscriptions[0], kind)]
+        scanned_ids = [subscriptions[0]["id"]]
     else:
         note(f"{verb} {len(subscriptions)} subscriptions...")
 
@@ -325,7 +329,9 @@ def scan_all(
                 return None
 
         with ThreadPoolExecutor(max_workers=8) as pool:
-            inventories = [i for i in pool.map(one, subscriptions) if i]
+            results = list(pool.map(one, subscriptions))
+        scanned_ids = [s["id"] for s, i in zip(subscriptions, results) if i]
+        inventories = [i for i in results if i]
         if not inventories:
             raise SystemExit("Every subscription failed to scan.")
 
@@ -344,6 +350,15 @@ def scan_all(
         # Linked after the merge, so a connection to a gateway in another
         # subscription still finds it.
         link_vpn(merged)
+    if kind == "peerings":
+        # Likewise, so each side of a cross-subscription peering finds the
+        # other when both subscriptions were scanned.
+        names: Dict[str, str] = {}
+        try:
+            names = {s["id"].lower(): s["name"] for s in ingestor.get_subscriptions()}
+        except AzureError:
+            pass
+        link_peerings(merged, names, scanned_ids)
     return merged
 
 
@@ -940,6 +955,107 @@ def lb_json(lb: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------- peerings ---
+
+
+def scan_peerings(ingestor: AzureResourceIngestor, subscription: Dict[str, Any]) -> Dict[str, Any]:
+    """Every VNet peering in the subscription, one record per side."""
+    subscription_id = subscription["id"]
+    peerings = ingestor.get_vnet_peerings(subscription_id)
+    vnets = ingestor.get_vnets_and_subnets(subscription_id)
+    spaces = {(v.get("id") or "").lower(): v.get("address_prefixes") or [] for v in vnets.values()}
+    out = []
+    for p in peerings:
+        source_id = p.get("source_vnet_id") or ""
+        remote_id = p.get("remote_vnet_id") or ""
+        parts = remote_id.split("/")
+        out.append({
+            "id": p.get("id") or "",
+            "name": p.get("name") or "",
+            # Filed under the VNet it lives on, as the portal lists it.
+            "resource_group": p.get("source_resource_group") or (source_id.split("/")[4] if source_id else ""),
+            "vnet": p.get("source_vnet") or "",
+            "vnet_id": source_id,
+            "vnet_address_space": spaces.get(source_id.lower(), []),
+            "remote_vnet": parts[-1] if remote_id else "",
+            "remote_vnet_id": remote_id,
+            "remote_resource_group": parts[4] if len(parts) > 4 else "",
+            "remote_subscription_id": parts[2] if len(parts) > 2 else "",
+            "remote_address_space": p.get("remote_address_space") or [],
+            "state": str(p.get("peering_state") or "").split(".")[-1],
+            "sync": str(p.get("peering_sync_level") or "").split(".")[-1],
+            "allow_vnet_access": p.get("allow_virtual_network_access"),
+            "allow_forwarded_traffic": p.get("allow_forwarded_traffic"),
+            "allow_gateway_transit": p.get("allow_gateway_transit"),
+            "use_remote_gateways": p.get("use_remote_gateways"),
+            "subscription": subscription["name"],
+            "subscription_id": subscription_id,
+        })
+    return {"peerings": out, "subnet_names": {}}
+
+
+def link_peerings(inventory: Dict[str, Any], names: Dict[str, str], scanned_ids: List[str]) -> None:
+    """Find each peering's other side, and name the remote subscription.
+
+    The other side can only be checked when its subscription was scanned
+    too; otherwise it says so rather than guessing. A Connected state still
+    proves the far side exists, since Azure only reports that when both do.
+    """
+    scanned = {k.lower() for k in scanned_ids}
+    pairs = {(o["vnet_id"].lower(), o["remote_vnet_id"].lower()) for o in inventory.get("peerings", [])}
+    for p in inventory.get("peerings", []):
+        remote_sub = p["remote_subscription_id"].lower()
+        p["remote_subscription"] = names.get(remote_sub) or p["remote_subscription_id"]
+        p["cross_subscription"] = bool(remote_sub) and remote_sub != p["subscription_id"].lower()
+        if (p["remote_vnet_id"].lower(), p["vnet_id"].lower()) in pairs:
+            p["other_side"] = "present"
+        elif remote_sub in scanned:
+            p["other_side"] = "missing"
+        else:
+            p["other_side"] = "present" if p["state"] == "Connected" else "not scanned"
+
+
+PEER_HEADERS = ["VNET", "RESOURCE GROUP", "PEERING", "REMOTE VNET", "REMOTE RG", "REMOTE SUBSCRIPTION",
+                "REMOTE ADDRESS SPACE", "STATE", "SYNC", "OTHER SIDE", "FWD TRAFFIC", "GW TRANSIT",
+                "REMOTE GW"]
+
+
+def peer_row(p: Dict[str, Any], cap: Optional[int] = None) -> List[str]:
+    return [
+        p["vnet"], p["resource_group"], p["name"], p["remote_vnet"], p["remote_resource_group"],
+        p.get("remote_subscription") or p["remote_subscription_id"],
+        join_list(p["remote_address_space"], cap),
+        p["state"], p["sync"].replace("FullyInSync", "in sync"), p.get("other_side", ""),
+        yes_no(p["allow_forwarded_traffic"]), yes_no(p["allow_gateway_transit"]),
+        yes_no(p["use_remote_gateways"]),
+    ]
+
+
+def peer_keep(p: Dict[str, Any], args) -> bool:
+    if args.vnet and not matches_any(p["vnet"], args.vnet):
+        return False
+    if args.remote and not (matches_any(p["remote_vnet"], args.remote)
+                            or matches_any(p.get("remote_subscription"), args.remote)):
+        return False
+    if args.state and p["state"].lower() != args.state:
+        return False
+    if args.cross_sub and not p.get("cross_subscription"):
+        return False
+    if args.problems and p["state"] == "Connected" and p["sync"] in ("", "FullyInSync") \
+            and p.get("other_side") != "missing":
+        return False
+    return True
+
+
+def peer_json(p: Dict[str, Any]) -> Dict[str, Any]:
+    keys = ["name", "id", "resource_group", "vnet", "vnet_id", "vnet_address_space",
+            "remote_vnet", "remote_vnet_id", "remote_resource_group", "remote_subscription",
+            "remote_subscription_id", "remote_address_space", "cross_subscription", "state",
+            "sync", "other_side", "allow_vnet_access", "allow_forwarded_traffic",
+            "allow_gateway_transit", "use_remote_gateways"]
+    return {k: p.get(k) for k in keys}
+
+
 def sub_head(args) -> List[str]:
     """A leading SUBSCRIPTION column, when the run spans more than one."""
     return ["SUBSCRIPTION"] if args.multi_sub else []
@@ -1097,6 +1213,8 @@ def keep(obj: Dict[str, Any], args, kind: str, rules_as_written: bool = True) ->
         return vpn_keep(obj, args, kind)
     if kind == "lbs":
         return lb_keep(obj, args)
+    if kind == "peerings":
+        return peer_keep(obj, args)
 
     if kind == "subnets":
         nsg_names = [layer["nsg"]["name"] for layer in obj["layers"]]
@@ -1480,6 +1598,11 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
     if kind == "lbs":
         render_lb_table(objects, args)
         return
+    if kind == "peerings":
+        cap = None if args.full else CELL_WIDTH
+        print_table(sub_head(args) + PEER_HEADERS,
+                    [sub_cols(o, args) + peer_row(o, cap) for o in objects])
+        return
     if args.effective:
         render_effective_table(objects, args)
         return
@@ -1645,6 +1768,8 @@ def structured(objects: List[Dict[str, Any]], args, kind: str) -> List[Dict[str,
         data = [vpn_json(n) for n in objects]
     elif kind == "lbs":
         data = [lb_json(n) for n in objects]
+    elif kind == "peerings":
+        data = [peer_json(n) for n in objects]
     elif kind == "nics":
         data = [nic_json(n, args) for n in objects]
     else:
@@ -1909,6 +2034,11 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
         for obj in objects:
             row(obj, vpn_row(obj, kind))
         return
+    if kind == "peerings":
+        head(PEER_HEADERS)
+        for p in objects:
+            row(p, peer_row(p))
+        return
     if kind == "lbs":
         # --detail: a row per load-balancing rule, the shape to rebuild from.
         if args.detail:
@@ -1988,6 +2118,7 @@ def snapshot_subscription(ingestor: AzureResourceIngestor, sub: Dict[str, Any]) 
         "route_tables": ingestor.get_route_tables(sub_id),
         "vpn": ingestor.get_vpn_inventory(sub_id),
         "load_balancers": ingestor.get_load_balancers(sub_id, public_ips),
+        "peerings": ingestor.get_vnet_peerings(sub_id),
     }
 
 
@@ -2048,6 +2179,9 @@ class SnapshotIngestor:
     def get_load_balancers(self, sub_id, public_ips=None):
         return self._part(sub_id, "load_balancers", [])
 
+    def get_vnet_peerings(self, sub_id):
+        return self._part(sub_id, "peerings", [])
+
 
 def run_export(args) -> int:
     path = args.out or datetime.now().strftime("azmap-snapshot-%Y%m%d-%H%M.yaml")
@@ -2099,6 +2233,7 @@ def run_export(args) -> int:
         "local gateways": sum(len(r["vpn"]["local_gateways"]) for r in recorded),
         "connections": sum(len(r["vpn"]["connections"]) for r in recorded),
         "load balancers": sum(len(r["load_balancers"]) for r in recorded),
+        "peerings": sum(len(r["peerings"]) for r in recorded),
     }
     note(f"Wrote {path}: " + ", ".join(f"{n} {k}" for k, n in counts.items()))
     return 0
@@ -2108,7 +2243,7 @@ def run_export(args) -> int:
 
 NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs", "subnets": "subnets",
          "gateways": "gateways", "local-gateways": "local gateways",
-         "connections": "connections", "lbs": "load balancers"}
+         "connections": "connections", "lbs": "load balancers", "peerings": "peerings"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2161,7 +2296,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="azmap",
-        description="Query VMs, NICs, NSGs, subnets, VPN gateways and load balancers "
+        description="Query VMs, NICs, NSGs, subnets, peerings, VPN gateways and load balancers "
                     "with the web app's Azure identity.",
         epilog="Example: azmap vms --port 3389 --from internet --access allow",
     )
@@ -2240,6 +2375,20 @@ def build_parser() -> argparse.ArgumentParser:
                      help="frontends, pools, rules, probes, NAT and outbound rules of each, "
                           "below the table; with -o csv, a row per rule")
 
+    peerings = commands.add_parser(
+        "peerings", parents=[common],
+        help="VNet peerings, both sides checked, across subscriptions too",
+    )
+    peerings.add_argument("--vnet", action="append", metavar="GLOB", help="VNet the peering is on")
+    peerings.add_argument("--remote", action="append", metavar="GLOB",
+                          help="remote VNet, or remote subscription name")
+    peerings.add_argument("--state", type=str.lower,
+                          choices=["connected", "disconnected", "initiated"])
+    peerings.add_argument("--cross-sub", action="store_true",
+                          help="only peerings to a VNet in another subscription")
+    peerings.add_argument("--problems", action="store_true",
+                          help="not Connected, out of sync, or the other side is missing")
+
     export = commands.add_parser(
         "export", help="save everything to one YAML snapshot, readable later with --file",
     )
@@ -2266,6 +2415,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.file and getattr(args, "effective", False):
         parser.error("--effective asks Azure for live rules; a snapshot holds the "
                      "rules as written, which --rules shows")
+    if kind == "peerings" and rule_filter_active(args):
+        parser.error("--port, --from, --access and --proto filter NSG rules; peerings don't have any")
     if kind == "lbs" and (args.source or args.access or args.direction or args.defaults):
         parser.error("load balancers take --port and --proto (what a rule listens on); "
                      "--from, --access, --direction and --defaults are for NSG rules")

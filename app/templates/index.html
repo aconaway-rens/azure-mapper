@@ -187,12 +187,16 @@
             margin-bottom: 8px;
         }
 
+        .sub-color { background: #fbfaf5; border: 3px solid #5c5c5c; border-radius: 3px; }
+        .not-scanned { background: #eef1f4; border: 2px dotted #7a8a99; border-radius: 3px; }
         .rg { background: #f0f0f0; border: 2px dashed #a0a0a0; }
         .vnet { background: #e6f2ff; border: 2px dashed #0078d4; }
         .subnet { background: #50e6ff; }
         .subnet-workload { background: #50e6ff; border: 2px solid #8661c5; }
         .subnet-collapsed { background: #b9a3e0; border: 2px dashed #8661c5; }
         .peering { background: #107c10; }
+        .peering-1way { background: #d13438; }
+        .peering-degraded { background: #c77700; }
         .nic-color { background: #ff8c00; }
         .nic-orphan { background: #ff8c00; border: 2px dashed #d13438; }
         .attached-link { background: #8661c5; border-radius: 0; height: 3px; }
@@ -277,6 +281,10 @@
             flex-shrink: 0;
         }
 
+        .rg-item.disabled-sub {
+            color: #999;
+        }
+
         .rg-empty {
             font-size: 12px;
             color: #888;
@@ -295,10 +303,18 @@
             </div>
 
             <div class="section">
-                <h3>Subscription</h3>
-                <select id="subscriptionSelect">
-                    <option value="">-- Loading… --</option>
-                </select>
+                <h3>Subscriptions</h3>
+                <div class="filter-actions">
+                    <button onclick="setListedSubscriptions(true)">Select All</button>
+                    <button onclick="setListedSubscriptions(false)">Clear</button>
+                </div>
+                <input type="text" id="subSearch" placeholder="Search subscriptions…"
+                       oninput="renderSubscriptionList()">
+                <div id="subList" class="rg-list"></div>
+                <div class="field-hint">
+                    Tick more than one to draw them together; peerings
+                    between them join up.
+                </div>
                 <div id="subStatus" class="status" style="display:none;"></div>
             </div>
 
@@ -344,7 +360,7 @@
             <div class="section">
                 <h3>Graph Info</h3>
                 <div id="graphInfo" class="info-panel" style="display:none;">
-                    <strong>Subscription:</strong><br><span id="infoSub"></span><br><br>
+                    <strong>Subscriptions:</strong><br><span id="infoSub"></span><br><br>
                     <strong>Resource Groups:</strong><br><span id="infoRgs">0</span><br><br>
                     <strong>VMs:</strong><br><span id="infoVms">0</span><br><br>
                     <strong>Nodes:</strong><br><span id="infoNodes">0</span><br><br>
@@ -355,6 +371,10 @@
             <div class="section">
                 <h3>Legend</h3>
                 <div class="legend">
+                    <div class="legend-item">
+                        <div class="legend-color sub-color"></div>
+                        <span>Subscription (when several)</span>
+                    </div>
                     <div class="legend-item">
                         <div class="legend-color rg"></div>
                         <span>Resource Group</span>
@@ -377,7 +397,19 @@
                     </div>
                     <div class="legend-item">
                         <div class="legend-color peering"></div>
-                        <span>Peering</span>
+                        <span>Peering (bold: cross-subscription)</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color peering-degraded"></div>
+                        <span>Peering disconnected or out of sync</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color peering-1way"></div>
+                        <span>One-way peering</span>
+                    </div>
+                    <div class="legend-item">
+                        <div class="legend-color not-scanned"></div>
+                        <span>Peered VNet not scanned</span>
                     </div>
                     <div class="legend-item">
                         <div class="legend-color nic-color"></div>

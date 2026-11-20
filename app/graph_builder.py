@@ -1,6 +1,6 @@
 """Build logical graph model from Azure resources."""
 
-from typing import Dict, List, Any
+from typing import Any, Dict, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -85,7 +85,156 @@ class TopologyGraph:
         return edge
 
     def build_from_azure_scan(self, scan_data: Dict[str, Any]) -> None:
-        """Build graph from Azure scan data (VNets, subnets, peerings, VMs).
+        """Build the graph from one subscription's scan."""
+        self.build_from_azure_scans([scan_data])
+
+    def build_from_azure_scans(
+        self,
+        scans: List[Dict[str, Any]],
+        subscription_names: Optional[Dict[str, str]] = None,
+    ) -> None:
+        """Build one graph from the scans of one or more subscriptions.
+
+        Each subscription is a box holding its resource groups. Node IDs come
+        from Azure resource IDs, which are unique across subscriptions and
+        resource groups, so two VNets that share a name stay two VNets.
+
+        Peerings are wired once every scan is in, so a peering between two
+        scanned subscriptions joins the real VNets. A peering to a VNet that
+        wasn't scanned — another subscription, or one this identity can't
+        read — ends at a placeholder for it, named from its ID and labelled
+        with the address space the peering reports, rather than vanishing.
+
+        With a single subscription and nothing outside it, the subscription
+        box is left out, so the diagram looks as it always has.
+
+        ``subscription_names`` (lowercased ID -> name) names the subscription
+        of a placeholder when the identity can see it.
+        """
+        names = {k.lower(): v for k, v in (subscription_names or {}).items()}
+        self.vnet_nodes: Dict[str, str] = {}
+        # Lookups the load-balancer pass needs, shared across subscriptions
+        # since the keys are resource IDs.
+        subnet_nodes: Dict[str, str] = {}
+        nic_nodes: Dict[str, str] = {}
+        node_vnets: Dict[str, str] = {}
+        vnet_rgs: Dict[str, str] = {}
+
+        for scan in scans:
+            sub_id = (scan.get("subscription_id") or "").lower()
+            sub_name = scan.get("subscription_name") or names.get(sub_id) or sub_id
+            self._add_subscription(sub_id, sub_name, scanned=True)
+            self._build_one(scan, sub_id, subnet_nodes, nic_nodes, node_vnets, vnet_rgs)
+
+        for scan in scans:
+            sub_id = (scan.get("subscription_id") or "").lower()
+            self._add_peerings(scan.get("peerings", []), sub_id, names)
+
+        subs = [n for n in self.nodes.values() if n.type == "subscription"]
+        if len(scans) == 1 and len(subs) == 1:
+            for node in list(self.nodes.values()):
+                if node.parent == subs[0].id:
+                    node.parent = None
+            del self.nodes[subs[0].id]
+
+    def _add_subscription(self, sub_id: str, name: str, scanned: bool) -> str:
+        node_id = f"sub_{sub_id}"
+        if node_id not in self.nodes:
+            self.add_node(
+                node_id, "subscription",
+                name if scanned else f"{name}\n(not scanned)",
+                data={"subscription_id": sub_id, "name": name, "external": not scanned},
+            )
+        return node_id
+
+    def _add_resource_group(
+        self, sub_id: str, rg_name: str, location: str, external: bool = False,
+    ) -> str:
+        # ARM IDs don't agree on a group's case, so key on the lowered name
+        # and label with the first spelling seen.
+        node_id = f"rg_{sub_id}_{rg_name.lower()}"
+        if node_id not in self.nodes:
+            sub_node = self.nodes.get(f"sub_{sub_id}")
+            self.add_node(
+                node_id, "resource_group", rg_name,
+                parent=f"sub_{sub_id}",
+                data={
+                    "location": location,
+                    "subscription_id": sub_id,
+                    "subscription": sub_node.data.get("name", sub_id) if sub_node else sub_id,
+                    "external": external,
+                },
+            )
+        return node_id
+
+    def _add_peerings(
+        self, peerings: List[Dict[str, Any]], sub_id: str, names: Dict[str, str],
+    ) -> None:
+        for peering in peerings:
+            source = self.vnet_nodes.get((peering.get("source_vnet_id") or "").lower())
+            if source is None:
+                # Scans from before peerings carried the source ID.
+                source = next((
+                    node_id for node_id, node in self.nodes.items()
+                    if node.type == "vnet" and node.data.get("name") == peering.get("source_vnet")
+                    and node.data.get("subscription_id") == sub_id
+                ), None)
+            remote_id = (peering.get("remote_vnet_id") or "").lower()
+            if source is None or not remote_id:
+                continue
+            target = self.vnet_nodes.get(remote_id) or self._add_external_vnet(
+                remote_id, peering, names,
+            )
+            parts = remote_id.split("/")
+            remote_sub = parts[2] if len(parts) > 2 else ""
+            self.add_edge(source, target, "peered_to", {
+                "peering_state": peering.get("peering_state") or "Unknown",
+                "peering_sync_level": peering.get("peering_sync_level") or "",
+                "peering_name": peering.get("name"),
+                "cross_subscription": bool(remote_sub) and remote_sub != sub_id,
+                "remote_scanned": not self.nodes[target].data.get("external", False),
+                "allow_forwarded_traffic": peering.get("allow_forwarded_traffic"),
+                "allow_gateway_transit": peering.get("allow_gateway_transit"),
+                "use_remote_gateways": peering.get("use_remote_gateways"),
+            })
+
+    def _add_external_vnet(
+        self, remote_id: str, peering: Dict[str, Any], names: Dict[str, str],
+    ) -> str:
+        """A placeholder for the far end of a peering that wasn't scanned."""
+        original = peering.get("remote_vnet_id") or remote_id
+        parts = original.split("/")
+        if len(parts) < 9:
+            parts = (parts + [""] * 9)[:9]
+        remote_sub = parts[2].lower()
+        rg_name = parts[4] or "unknown"
+        vnet_name = parts[-1] or remote_id
+        self._add_subscription(remote_sub, names.get(remote_sub) or remote_sub, scanned=False)
+        rg_node = self._add_resource_group(remote_sub, rg_name, "", external=True)
+        node_id = f"vnet_{remote_id}"
+        space = peering.get("remote_address_space") or []
+        label = "\n".join([vnet_name] + ([", ".join(space)] if space else []) + ["not scanned"])
+        self.add_node(node_id, "vnet", label, parent=rg_node, data={
+            "azure_id": original,
+            "name": vnet_name,
+            "resource_group": rg_name,
+            "subscription_id": remote_sub,
+            "address_prefixes": space,
+            "external": True,
+        })
+        self.vnet_nodes[remote_id] = node_id
+        return node_id
+
+    def _build_one(
+        self,
+        scan_data: Dict[str, Any],
+        sub_id: str,
+        subnet_nodes: Dict[str, str],
+        nic_nodes: Dict[str, str],
+        node_vnets: Dict[str, str],
+        vnet_rgs: Dict[str, str],
+    ) -> None:
+        """Add one subscription's VNets, subnets and workloads.
 
         VM and NIC nodes are always built when the scan carries them. Whether
         they are *drawn* is the frontend's call — it collapses subnets busier
@@ -94,7 +243,6 @@ class TopologyGraph:
         than forcing a rescan.
         """
         vnets = scan_data.get("vnets", {})
-        peerings = scan_data.get("peerings", [])
 
         # Index NIC attachments by the subnet they land on. ARM IDs vary in
         # case between resources, so the ingest lowercases these keys.
@@ -122,32 +270,19 @@ class TopologyGraph:
         # vm_id -> {vnet node, [nic node ids]}, filled in as subnets are walked
         spanning_attachments: Dict[str, Dict[str, Any]] = {}
 
-        # Lookups the load-balancer pass needs. A backend NIC may have no node
-        # of its own — a NIC on a single-subnet VM is folded into that VM's
-        # card — so nic_nodes maps a NIC to whatever now stands for it.
-        subnet_nodes: Dict[str, str] = {}
-        nic_nodes: Dict[str, str] = {}
-        node_vnets: Dict[str, str] = {}
-        vnet_rgs: Dict[str, str] = {}
-
-        # Track resource groups so we create each one only once
-        resource_groups = set()
+        # A backend NIC may have no node of its own — a NIC on a single-subnet
+        # VM is folded into that VM's card — so nic_nodes maps a NIC to
+        # whatever now stands for it.
 
         # Create nodes for each VNet
-        for vnet_name, vnet_info in vnets.items():
+        for vnet_info in vnets.values():
+            vnet_name = vnet_info["name"]
             rg_name = vnet_info["resource_group"]
-            rg_id = f"rg_{rg_name}"
-
-            # Create resource group compound node if needed
-            if rg_name not in resource_groups:
-                resource_groups.add(rg_name)
-                self.add_node(
-                    rg_id, "resource_group", rg_name,
-                    data={"location": vnet_info["location"]},
-                )
+            rg_id = self._add_resource_group(sub_id, rg_name, vnet_info["location"])
 
             # Create VNet as child of resource group
-            vnet_id = f"vnet_{vnet_name}"
+            vnet_id = f"vnet_{vnet_info['id'].lower()}"
+            self.vnet_nodes[vnet_info["id"].lower()] = vnet_id
             vnet_rgs[vnet_id] = rg_id
             prefixes = vnet_info["address_prefixes"]
             vnet_label = (
@@ -159,7 +294,9 @@ class TopologyGraph:
                 parent=rg_id,
                 data={
                     "azure_id": vnet_info["id"],
+                    "name": vnet_name,
                     "resource_group": rg_name,
+                    "subscription_id": sub_id,
                     "address_prefixes": prefixes,
                     "location": vnet_info["location"],
                 },
@@ -172,7 +309,7 @@ class TopologyGraph:
                     f"{subnet['name']}\n{addr}" if addr
                     else subnet["name"]
                 )
-                subnet_node_id = f"subnet_{vnet_name}_{subnet['name']}"
+                subnet_node_id = f"subnet_{(subnet['id'] or '').lower()}"
                 subnet_nics = nics_by_subnet.get(
                     (subnet["id"] or "").lower(), []
                 )
@@ -210,26 +347,6 @@ class TopologyGraph:
             scan_data.get("load_balancers", []),
             subnet_nodes, nic_nodes, node_vnets, vnet_rgs,
         )
-
-        # Create peering edges
-        for peering in peerings:
-            source_vnet = peering.get("source_vnet")
-            remote_vnet_id = peering.get("remote_vnet_id", "")
-            remote_vnet_name = (
-                remote_vnet_id.split("/")[-1] if remote_vnet_id else None
-            )
-
-            if source_vnet and remote_vnet_name:
-                source_id = f"vnet_{source_vnet}"
-                target_id = f"vnet_{remote_vnet_name}"
-
-                if source_id in self.nodes and target_id in self.nodes:
-                    self.add_edge(source_id, target_id, "peered_to", {
-                        "peering_state": peering.get(
-                            "peering_state", "Unknown"
-                        ),
-                        "peering_name": peering.get("name"),
-                    })
 
     def _add_subnet_workloads(
         self,
@@ -388,7 +505,7 @@ class TopologyGraph:
         for vm_id, entry in spanning_attachments.items():
             vm = vms_by_id.get(vm_id, {})
             vm_name = vm.get("name") or vm_id.split("/")[-1]
-            vm_node_id = f"vm_shared_{vm_name}"
+            vm_node_id = f"vm_shared_{vm_id}"
             span = len(entry["nics"])
 
             self.add_node(
@@ -484,7 +601,7 @@ class TopologyGraph:
             else:
                 caption = "no frontend IP"
 
-            lb_node_id = f"lb_{lb['resource_group']}_{lb['name']}"
+            lb_node_id = f"lb_{lb['id'].lower()}"
             self.add_node(
                 lb_node_id, "lb", f"{lb['name']}\n{caption}",
                 parent=home,
@@ -555,7 +672,29 @@ class TopologyGraph:
         # Emit one edge per peering pair.
         for edges in peering_groups.values():
             rep = edges[0]
-            bidirectional = len(edges) >= 2
+            states = [e.data.get("peering_state") or "Unknown" for e in edges]
+            if rep.data.get("remote_scanned", True):
+                bidirectional = len(edges) >= 2
+            else:
+                # Only this side was read. Connected means the far side's
+                # peering exists too; anything else means it may not.
+                bidirectional = states[0] == "Connected"
+            bad_state = next((st for st in states if st != "Connected"), None)
+            out_of_sync = any(
+                (e.data.get("peering_sync_level") or "FullyInSync") != "FullyInSync"
+                for e in edges
+            )
+            cross = rep.data.get("cross_subscription", False)
+            if not bidirectional:
+                label = "1-way peering"
+            elif bad_state:
+                label = f"peering {bad_state}"
+            elif out_of_sync:
+                label = "peering out of sync"
+            else:
+                label = "peering"
+            if cross:
+                label = f"{label} (cross-sub)"
             pair_id = "peer_" + "__".join(sorted((rep.source, rep.target)))
             elements.append({
                 "data": {
@@ -563,8 +702,11 @@ class TopologyGraph:
                     "source": rep.source,
                     "target": rep.target,
                     "type": "peered_to",
-                    "bidirectional": bidirectional,
                     **rep.data,
+                    "bidirectional": bidirectional,
+                    "degraded": bool(bad_state or out_of_sync),
+                    "peering_states": states,
+                    "label": label,
                 }
             })
 
