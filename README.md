@@ -63,7 +63,7 @@ else; no topology data leaves the host it runs on.
 
 ## Command-line queries
 
-`app/azmap.py` answers questions about VMs, NICs, NSGs, subnets and VPN gateways from the terminal,
+`app/azmap.py` answers questions about VMs, NICs, NSGs, subnets, VPN gateways and load balancers from the terminal,
 using the app's own credential — whatever identity the web app resolves on a
 host, the CLI resolves too. It needs nothing beyond `app/requirements.txt`.
 
@@ -75,6 +75,7 @@ python app/azmap.py nsgs --sub Prod --rg hub --vm fw01
 python app/azmap.py subnets --sub Prod --rg '*' --routes
 python app/azmap.py vms  --sub Prod --rg '*' --port 3389 --from internet --access allow
 python app/azmap.py vms  --sub '*' --rg '*'    # every VM in every subscription
+python app/azmap.py lbs  --sub '*' --rg '*'    # every load balancer, internal and external
 python app/azmap.py export --sub '*'           # everything, to one snapshot file
 python app/azmap.py gateways --file azmap-snapshot-20261119-1740.yaml --detail
 ```
@@ -110,6 +111,7 @@ the rule filters look at both.
 | `gateways` | `--type vpn\|expressroute`, `--detail` |
 | `local-gateways` | `--unused`, `--detail` |
 | `connections` | `--type`, `--status`, `--gateway`, `--remote`, `--detail` |
+| `lbs` (or `load-balancers`) | `--type internal\|external\|gateway`, `--vm`, `--frontend`, `--unused`, `--port`, `--proto`, `--detail` |
 
 NSG rule filters, on any command: `--port`, `--from` (`internet`, an IP or
 CIDR, or a service tag), `--access allow|deny`, `--proto`, `--direction`
@@ -214,6 +216,37 @@ subscription's resource listing, then each is read individually, which is
 what returns a connection's live status; one that can't be read is listed as
 `(unreadable)` with the reason.
 
+### Load balancers, internal and external
+
+```bash
+python app/azmap.py lbs --sub '*' --rg '*'                     # one line each
+python app/azmap.py lbs --sub Prod --rg '*' --type external
+python app/azmap.py lbs --sub '*' --rg '*' --vm 'web*'         # which LBs front these VMs?
+python app/azmap.py lbs --sub '*' --rg '*' --port 443          # what listens on 443?
+python app/azmap.py lbs --sub Prod --rg '*' --detail           # frontends, pools, rules, probes, NAT
+python app/azmap.py lbs --sub '*' --rg '*' -o csv --detail --out lb-rules.csv
+```
+
+The table gives each load balancer's type (`external` when a frontend has a
+public IP, `internal` otherwise, `gateway` for a Gateway SKU), SKU, frontend
+addresses with their public IP or subnet, rules as `TCP 443>8443` (`HA ports`
+for an internal all-ports rule), the VMs in its backend pools, and probes.
+
+`--detail` adds a table per part: frontends (address, public IP or subnet,
+allocation, zones); backend pools, one row per member with its VM, NIC,
+ip-config and private IP; load-balancing rules with every option (floating
+IP, idle timeout, TCP reset, distribution, outbound SNAT); probes; inbound NAT
+rules and NAT pools with their targets; and outbound rules. With `-o csv`,
+`--detail` writes one row per load-balancing rule with its frontend, pool
+members and probe spelled out.
+
+`--port` and `--proto` here mean what a load-balancing or NAT rule listens
+on, a NAT port range included; an HA ports rule matches every port.
+`-o json` and `-o yaml` carry all of that plus every setting Azure returns
+under its own names, and each public frontend's full public IP settings, so
+one record is enough to recreate it. Scale set instances show as
+`scaleset_instance`; a pool of bare IP addresses lists the addresses.
+
 ### Snapshots: export once, read back offline
 
 ```bash
@@ -225,8 +258,8 @@ python app/azmap.py connections --file prod.yaml -o csv --out tunnels.csv
 ```
 
 `export` saves everything azmap reads — VMs, NICs, public IPs, VNets and
-subnets, NSGs with their rules, route tables, gateways, local gateways and
-connections — for each subscription into one YAML file, with when it was
+subnets, NSGs with their rules, route tables, gateways, local gateways,
+connections and load balancers — for each subscription into one YAML file, with when it was
 taken and by which version. `--file` on any command reads that file instead
 of Azure: the same tables, filters, `--detail` and output formats, with no
 credential needed, so it works when Azure doesn't. It covers every
@@ -239,7 +272,10 @@ Keep these as the record to rebuild from. Things to know:
 - **No effective rules.** `--effective` asks Azure live, so it doesn't work
   with `--file`; `--rules` shows the rules as written, which is what you'd
   rebuild anyway.
-- **Diffable.** Gateway settings are written in sorted order, so two
+- **Re-export after upgrading.** A snapshot holds what its version of azmap
+  recorded; one taken before load balancers were added (v1.13.0) says so
+  rather than showing none.
+- **Diffable.** Gateway and load balancer settings are written in sorted order, so two
   snapshots of an unchanged environment diff clean.
 - **Only export files read back.** A file from `-o yaml` is a report shaped
   for reading, not a snapshot, and `--file` says so.
@@ -419,7 +455,7 @@ every source it tried and why each failed. Common causes:
 ├── app/
 │   ├── app.py              # Flask backend
 │   ├── azure_ingest.py     # Azure SDK resource discovery + credential handling
-│   ├── azmap.py            # CLI: query VMs, NICs, NSGs, subnets, VPN with the same credential
+│   ├── azmap.py            # CLI: VMs, NICs, NSGs, subnets, VPN, LBs; export/--file snapshots
 │   ├── graph_builder.py    # Topology graph model
 │   ├── requirements.txt
 │   ├── static/

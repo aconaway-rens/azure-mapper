@@ -5,6 +5,8 @@
     python app/azmap.py nsgs  [--sub SUB] [--rg RG ...] [filters]
     python app/azmap.py subnets [--sub SUB] [--rg RG ...] [filters]
     python app/azmap.py gateways | local-gateways | connections [--detail]
+    python app/azmap.py lbs [--type internal|external] [--detail]
+    python app/azmap.py export [--sub '*']      then any command with --file
 
 Authentication is the app's own: DefaultAzureCredential, through azure_ingest,
 so whatever identity the web app resolves on this host, the CLI resolves too.
@@ -87,6 +89,8 @@ def scan(ingestor: AzureResourceIngestor, subscription: Dict[str, Any], kind: st
     """
     if kind in VPN_KINDS:
         return scan_vpn(ingestor, subscription)
+    if kind == "lbs":
+        return scan_lbs(ingestor, subscription)
     subscription_id = subscription["id"]
     public_ips = ingestor.get_public_ips(subscription_id)
     compute = ingestor.get_nics_and_vms(subscription_id, public_ips)
@@ -587,6 +591,355 @@ def render_vpn_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
             print(line)
 
 
+# -------------------------------------------------------- load balancers ---
+
+
+def last(resource_id: Optional[str]) -> str:
+    """A resource's name: the last segment of its ID."""
+    return resource_id.rstrip("/").split("/")[-1] if resource_id else ""
+
+
+def raw_ref(value: Any) -> Optional[str]:
+    """The resource ID out of an ARM reference, in its original case."""
+    return value.get("id") if isinstance(value, dict) and value.get("id") else None
+
+
+def scan_lbs(ingestor: AzureResourceIngestor, subscription: Dict[str, Any]) -> Dict[str, Any]:
+    """Load balancers, with frontends, pools, rules and probes made readable.
+
+    Azure names every piece of a load balancer by ID: a rule points at its
+    frontend, pool and probe; a pool lists NIC ip-configs. Each is resolved
+    here to a name, and each pool member to its VM and private IP.
+    """
+    subscription_id = subscription["id"]
+    public_ips = ingestor.get_public_ips(subscription_id)
+    compute = ingestor.get_nics_and_vms(subscription_id, public_ips)
+    vnets = ingestor.get_vnets_and_subnets(subscription_id)
+    balancers = ingestor.get_load_balancers(subscription_id, public_ips)
+
+    subnet_names = {
+        subnet["id"].lower(): f"{vnet['name']}/{subnet['name']}"
+        for vnet in vnets.values() for subnet in vnet["subnets"]
+    }
+    by_ipconfig: Dict[str, Dict[str, Any]] = {}
+    by_nic: Dict[str, Dict[str, Any]] = {}
+    for record in compute["nics"]:
+        by_nic.setdefault(record["id"].lower(), record)
+        if record.get("ip_configuration"):
+            by_ipconfig[f"{record['id']}/ipConfigurations/{record['ip_configuration']}".lower()] = record
+
+    def member(config_id: str) -> Dict[str, Any]:
+        nic_id = re.split(r"/ipConfigurations/", config_id, flags=re.I)[0]
+        record = by_ipconfig.get(config_id.lower()) or by_nic.get(nic_id.lower()) or {}
+        vm = record.get("vm_name") or ""
+        parts = config_id.split("/")
+        lowered = [p.lower() for p in parts]
+        if not vm and "virtualmachinescalesets" in lowered:
+            # A scale set instance's NIC isn't in the NIC listing; its ID
+            # still says which scale set and instance it belongs to.
+            i = lowered.index("virtualmachinescalesets")
+            vm = f"{parts[i + 1]}_{parts[i + 3]}" if len(parts) > i + 3 else parts[i + 1]
+        return {"vm": vm, "nic": last(nic_id), "ip_configuration": last(config_id),
+                "ip": record.get("private_ip") or ""}
+
+    for lb in balancers:
+        props = lb.get("properties") or {}
+
+        lb["frontend_list"] = []
+        for fe in props.get("frontendIPConfigurations") or []:
+            fp = fe.get("properties") or {}
+            entry: Dict[str, Any] = {"name": fe.get("name") or "", "zones": fe.get("zones") or []}
+            pip_id = ref_id(fp.get("publicIPAddress"))
+            if pip_id:
+                pip = public_ips.get(pip_id) or {}
+                entry["address"] = pip.get("ip_address") or ("(unassigned)" if pip else "(unknown)")
+                entry["public_ip"] = pip.get("name") or last(pip_id)
+                # What it takes to recreate the address resource itself.
+                entry["public_ip_settings"] = {
+                    k: v for k, v in pip.items() if k not in ("ip_address", "name")
+                }
+            else:
+                subnet_id = ref_id(fp.get("subnet"))
+                entry["address"] = fp.get("privateIPAddress") or ""
+                entry["allocation"] = fp.get("privateIPAllocationMethod") or ""
+                entry["subnet"] = subnet_names.get(subnet_id, last(subnet_id)) if subnet_id else ""
+            lb["frontend_list"].append(entry)
+
+        lb["pools"] = []
+        for pool in props.get("backendAddressPools") or []:
+            pp = pool.get("properties") or {}
+            members, seen = [], set()
+            for config in pp.get("backendIPConfigurations") or []:
+                cid = raw_ref(config)
+                if cid and cid.lower() not in seen:
+                    seen.add(cid.lower())
+                    members.append(member(cid))
+            for address in pp.get("loadBalancerBackendAddresses") or []:
+                ap = address.get("properties") or {}
+                cid = raw_ref(ap.get("networkInterfaceIPConfiguration"))
+                if cid:
+                    if cid.lower() not in seen:
+                        seen.add(cid.lower())
+                        members.append(member(cid))
+                    continue
+                # A pool can also list bare IP addresses in a VNet.
+                members.append({"vm": "", "nic": "", "ip_configuration": "",
+                                "ip": ap.get("ipAddress") or "", "name": address.get("name") or "",
+                                "vnet": last(raw_ref(ap.get("virtualNetwork")))})
+            lb["pools"].append({"name": pool.get("name") or "", "members": members})
+
+        lb["rules"] = []
+        for rule in props.get("loadBalancingRules") or []:
+            rp = rule.get("properties") or {}
+            pools = [last(raw_ref(p)) for p in rp.get("backendAddressPools") or []] or (
+                [last(raw_ref(rp.get("backendAddressPool")))] if rp.get("backendAddressPool") else [])
+            lb["rules"].append({
+                "name": rule.get("name") or "",
+                "frontend": last(raw_ref(rp.get("frontendIPConfiguration"))),
+                "protocol": rp.get("protocol") or "",
+                "frontend_port": rp.get("frontendPort"),
+                "backend_port": rp.get("backendPort"),
+                "pools": pools,
+                "probe": last(raw_ref(rp.get("probe"))),
+                "floating_ip": bool(rp.get("enableFloatingIP")),
+                "idle_timeout_minutes": rp.get("idleTimeoutInMinutes"),
+                "tcp_reset": bool(rp.get("enableTcpReset")),
+                "load_distribution": rp.get("loadDistribution") or "Default",
+                "outbound_snat": not rp.get("disableOutboundSnat"),
+            })
+
+        lb["probes"] = []
+        for probe in props.get("probes") or []:
+            pp = probe.get("properties") or {}
+            lb["probes"].append({
+                "name": probe.get("name") or "",
+                "protocol": pp.get("protocol") or "",
+                "port": pp.get("port"),
+                "path": pp.get("requestPath") or "",
+                "interval_seconds": pp.get("intervalInSeconds"),
+                "count": pp.get("probeThreshold") or pp.get("numberOfProbes"),
+            })
+
+        lb["nat_rules"] = []
+        for nat in props.get("inboundNatRules") or []:
+            np_ = nat.get("properties") or {}
+            start, end = np_.get("frontendPortRangeStart"), np_.get("frontendPortRangeEnd")
+            target_id = raw_ref(np_.get("backendIPConfiguration"))
+            if target_id:
+                m = member(target_id)
+                target = f"{m['vm'] or m['nic']} {m['ip']}".strip()
+            elif np_.get("backendAddressPool"):
+                target = f"pool {last(raw_ref(np_.get('backendAddressPool')))}"
+            else:
+                target = ""
+            lb["nat_rules"].append({
+                "name": nat.get("name") or "",
+                "frontend": last(raw_ref(np_.get("frontendIPConfiguration"))),
+                "protocol": np_.get("protocol") or "",
+                "frontend_port": f"{start}-{end}" if start else np_.get("frontendPort"),
+                "backend_port": np_.get("backendPort"),
+                "target": target,
+                "floating_ip": bool(np_.get("enableFloatingIP")),
+                "idle_timeout_minutes": np_.get("idleTimeoutInMinutes"),
+                "tcp_reset": bool(np_.get("enableTcpReset")),
+            })
+        # The older, scale-set-only form of the same thing.
+        for nat in props.get("inboundNatPools") or []:
+            np_ = nat.get("properties") or {}
+            lb["nat_rules"].append({
+                "name": nat.get("name") or "",
+                "frontend": last(raw_ref(np_.get("frontendIPConfiguration"))),
+                "protocol": np_.get("protocol") or "",
+                "frontend_port": f"{np_.get('frontendPortRangeStart')}-{np_.get('frontendPortRangeEnd')}",
+                "backend_port": np_.get("backendPort"),
+                "target": "(NAT pool, scale set)",
+                "floating_ip": bool(np_.get("enableFloatingIP")),
+                "idle_timeout_minutes": np_.get("idleTimeoutInMinutes"),
+                "tcp_reset": bool(np_.get("enableTcpReset")),
+            })
+
+        lb["outbound_rules"] = []
+        for out in props.get("outboundRules") or []:
+            op = out.get("properties") or {}
+            lb["outbound_rules"].append({
+                "name": out.get("name") or "",
+                "frontends": [last(raw_ref(f)) for f in op.get("frontendIPConfigurations") or []],
+                "pool": last(raw_ref(op.get("backendAddressPool"))),
+                "protocol": op.get("protocol") or "",
+                "allocated_ports": op.get("allocatedOutboundPorts"),
+                "idle_timeout_minutes": op.get("idleTimeoutInMinutes"),
+                "tcp_reset": bool(op.get("enableTcpReset")),
+            })
+
+        if (lb.get("sku") or "").lower() == "gateway":
+            lb["type"] = "gateway"
+        elif any("public_ip" in f for f in lb["frontend_list"]):
+            lb["type"] = "external"
+        else:
+            lb["type"] = "internal" if lb["frontend_list"] else ""
+        lb["backend_vms"] = sorted(
+            {m["vm"] or m["ip"] for p in lb["pools"] for m in p["members"] if m["vm"] or m["ip"]},
+            key=str.lower,
+        )
+        lb["subscription"] = subscription["name"]
+        lb["subscription_id"] = subscription_id
+
+    return {"lbs": balancers, "subnet_names": subnet_names}
+
+
+def port_text(port: Any) -> str:
+    return "" if port is None else str(port)
+
+
+def lb_rule_text(rule: Dict[str, Any]) -> str:
+    if rule["protocol"].lower() == "all" and not rule["frontend_port"]:
+        return "HA ports"
+    return f"{rule['protocol'].upper()} {rule['frontend_port']}>{rule['backend_port']}"
+
+
+def probe_text(probe: Dict[str, Any]) -> str:
+    return f"{probe['protocol'].upper()} {probe['port']}{(' ' + probe['path']) if probe['path'] else ''}"
+
+
+def frontend_text(fe: Dict[str, Any]) -> str:
+    where_ = fe.get("public_ip") or fe.get("subnet") or ""
+    return f"{fe['address']} ({where_})" if where_ else fe["address"]
+
+
+LB_HEADERS = ["NAME", "RESOURCE GROUP", "TYPE", "SKU", "FRONTEND", "RULES", "BACKEND", "PROBES"]
+
+
+def lb_row(lb: Dict[str, Any], cap: Optional[int] = None) -> List[str]:
+    return [
+        lb["name"], lb["resource_group"], lb["type"], lb["sku"],
+        join_list([frontend_text(f) for f in lb["frontend_list"]], cap),
+        join_list([lb_rule_text(r) for r in lb["rules"]], cap) or "none",
+        join_list(lb["backend_vms"], cap) or "empty",
+        join_list([probe_text(p) for p in lb["probes"]], cap) or "none",
+    ]
+
+
+def lb_keep(lb: Dict[str, Any], args) -> bool:
+    if args.type and lb["type"] != args.type:
+        return False
+    if args.vm and not any(matches_any(v, args.vm) for v in lb["backend_vms"]):
+        return False
+    if args.frontend and not any(
+        matches_any(f["address"], args.frontend) or matches_any(f.get("public_ip"), args.frontend)
+        or matches_any(f["name"], args.frontend)
+        for f in lb["frontend_list"]
+    ):
+        return False
+    if args.unused and lb["backend_vms"]:
+        return False
+    if args.port is not None or args.proto:
+        def listens(protocol: str, port: Any) -> bool:
+            if args.proto and protocol.lower() not in (args.proto, "all"):
+                return False
+            if args.port is None:
+                return True
+            text = str(port or "")
+            if not text or text == "0":
+                return protocol.lower() == "all"  # HA ports: every port
+            if "-" in text:
+                low, high = text.split("-", 1)
+                return int(low) <= args.port <= int(high)
+            return int(text) == args.port
+        if not any(listens(r["protocol"], r["frontend_port"]) for r in lb["rules"]) and \
+                not any(listens(n["protocol"], n["frontend_port"]) for n in lb["nat_rules"]):
+            return False
+    return True
+
+
+def render_lb_table(objects: List[Dict[str, Any]], args) -> None:
+    cap = None if args.full else CELL_WIDTH
+    print_table(sub_head(args) + LB_HEADERS, [sub_cols(o, args) + lb_row(o, cap) for o in objects])
+    if not args.detail:
+        return
+    for lb in objects:
+        print()
+        print(f"{lb['name']}  ({where(lb, args)}, {lb['location']})  {lb['type']}, {lb['sku']} {lb['tier']}".rstrip())
+        sections = [
+            ("Frontends", ["FRONTEND", "ADDRESS", "PUBLIC IP / SUBNET", "ALLOCATION", "ZONES"],
+             [[f["name"], f["address"], f.get("public_ip") or f.get("subnet") or "",
+               f.get("allocation") or (f.get("public_ip_settings") or {}).get("allocation", ""),
+               ",".join(f["zones"]) or "none"] for f in lb["frontend_list"]]),
+            ("Backend pools", ["POOL", "VM", "NIC", "IP CONFIG", "IP"],
+             [[p["name"], m["vm"], m["nic"], m["ip_configuration"], m["ip"]]
+              for p in lb["pools"] for m in p["members"]]
+             + [[p["name"], "(empty)", "", "", ""] for p in lb["pools"] if not p["members"]]),
+            ("Rules", ["RULE", "FRONTEND", "PROTO", "FRONT", "BACK", "POOL", "PROBE",
+                       "FLOATING IP", "IDLE MIN", "TCP RESET", "DISTRIBUTION", "OUTBOUND SNAT"],
+             [[r["name"], r["frontend"], r["protocol"], port_text(r["frontend_port"]),
+               port_text(r["backend_port"]), ",".join(r["pools"]), r["probe"],
+               yes_no(r["floating_ip"]), port_text(r["idle_timeout_minutes"]),
+               yes_no(r["tcp_reset"]), r["load_distribution"], yes_no(r["outbound_snat"])]
+              for r in lb["rules"]]),
+            ("Probes", ["PROBE", "PROTO", "PORT", "PATH", "INTERVAL S", "COUNT"],
+             [[p["name"], p["protocol"], port_text(p["port"]), p["path"],
+               port_text(p["interval_seconds"]), port_text(p["count"])] for p in lb["probes"]]),
+            ("Inbound NAT rules", ["NAT RULE", "FRONTEND", "PROTO", "FRONT", "BACK", "TARGET",
+                                   "FLOATING IP", "IDLE MIN", "TCP RESET"],
+             [[n["name"], n["frontend"], n["protocol"], port_text(n["frontend_port"]),
+               port_text(n["backend_port"]), n["target"], yes_no(n["floating_ip"]),
+               port_text(n["idle_timeout_minutes"]), yes_no(n["tcp_reset"])]
+              for n in lb["nat_rules"]]),
+            ("Outbound rules", ["OUTBOUND RULE", "FRONTENDS", "POOL", "PROTO", "PORTS PER VM",
+                                "IDLE MIN", "TCP RESET"],
+             [[o["name"], ",".join(o["frontends"]), o["pool"], o["protocol"],
+               port_text(o["allocated_ports"]) or "default", port_text(o["idle_timeout_minutes"]),
+               yes_no(o["tcp_reset"])] for o in lb["outbound_rules"]]),
+        ]
+        for title, headers, rows in sections:
+            if rows:
+                print(f"  {title}:")
+                print_table(headers, rows, "    ")
+
+
+LB_RULE_CSV = ["RULE", "FRONTEND", "FRONTEND IP", "PROTOCOL", "FRONTEND PORT", "BACKEND PORT",
+               "POOL", "BACKEND", "PROBE", "FLOATING IP", "IDLE MINUTES", "TCP RESET",
+               "DISTRIBUTION", "OUTBOUND SNAT"]
+
+
+def lb_rule_rows(lb: Dict[str, Any]) -> List[List[str]]:
+    """One CSV row per load-balancing rule, with what it points at spelled out."""
+    frontends = {f["name"]: frontend_text(f) for f in lb["frontend_list"]}
+    pools = {p["name"]: p["members"] for p in lb["pools"]}
+    probes = {p["name"]: probe_text(p) for p in lb["probes"]}
+    rows = []
+    for r in lb["rules"]:
+        members = [m["vm"] or m["ip"] for name in r["pools"] for m in pools.get(name, [])]
+        rows.append([
+            r["name"], r["frontend"], frontends.get(r["frontend"], ""), r["protocol"],
+            port_text(r["frontend_port"]), port_text(r["backend_port"]), ",".join(r["pools"]),
+            ",".join(m for m in members if m), probes.get(r["probe"], r["probe"]),
+            yes_no(r["floating_ip"]), port_text(r["idle_timeout_minutes"]),
+            yes_no(r["tcp_reset"]), r["load_distribution"], yes_no(r["outbound_snat"]),
+        ])
+    return rows or [[""] * len(LB_RULE_CSV)]
+
+
+def lb_json(lb: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "name": lb["name"],
+        "id": lb["id"],
+        "resource_group": lb["resource_group"],
+        "location": lb["location"],
+        "type": lb["type"],
+        "sku": lb["sku"],
+        "tier": lb.get("tier", ""),
+        "frontends": lb["frontend_list"],
+        "backend_pools": lb["pools"],
+        "rules": lb["rules"],
+        "probes": lb["probes"],
+        "inbound_nat_rules": lb["nat_rules"],
+        "outbound_rules": lb["outbound_rules"],
+        "tags": lb.get("tags") or {},
+        # Every setting Azure returned, under Azure's own names.
+        "properties": lb.get("properties") or {},
+    }
+
+
 def sub_head(args) -> List[str]:
     """A leading SUBSCRIPTION column, when the run spans more than one."""
     return ["SUBSCRIPTION"] if args.multi_sub else []
@@ -742,6 +1095,8 @@ def keep(obj: Dict[str, Any], args, kind: str, rules_as_written: bool = True) ->
         return False
     if kind in VPN_KINDS:
         return vpn_keep(obj, args, kind)
+    if kind == "lbs":
+        return lb_keep(obj, args)
 
     if kind == "subnets":
         nsg_names = [layer["nsg"]["name"] for layer in obj["layers"]]
@@ -1122,6 +1477,9 @@ def render_table(objects: List[Dict[str, Any]], args, kind: str) -> None:
     if kind in VPN_KINDS:
         render_vpn_table(objects, args, kind)
         return
+    if kind == "lbs":
+        render_lb_table(objects, args)
+        return
     if args.effective:
         render_effective_table(objects, args)
         return
@@ -1285,6 +1643,8 @@ def structured(objects: List[Dict[str, Any]], args, kind: str) -> List[Dict[str,
         data = [subnet_json(n, args) for n in objects]
     elif kind in VPN_KINDS:
         data = [vpn_json(n) for n in objects]
+    elif kind == "lbs":
+        data = [lb_json(n) for n in objects]
     elif kind == "nics":
         data = [nic_json(n, args) for n in objects]
     else:
@@ -1549,6 +1909,18 @@ def render_csv(objects: List[Dict[str, Any]], args, kind: str) -> None:
         for obj in objects:
             row(obj, vpn_row(obj, kind))
         return
+    if kind == "lbs":
+        # --detail: a row per load-balancing rule, the shape to rebuild from.
+        if args.detail:
+            head(LB_HEADERS[:4] + LB_RULE_CSV)
+            for lb in objects:
+                for cells in lb_rule_rows(lb):
+                    row(lb, lb_row(lb)[:4] + cells)
+        else:
+            head(LB_HEADERS)
+            for lb in objects:
+                row(lb, lb_row(lb))
+        return
     if args.effective:
         head(["VM", "RESOURCE GROUP", "NIC", "PUBLIC IP", "PUBLIC IP NAME", "LAYER", "NSG"] + RULE_HEADERS)
         for vm in objects:
@@ -1615,6 +1987,7 @@ def snapshot_subscription(ingestor: AzureResourceIngestor, sub: Dict[str, Any]) 
         "nsgs": ingestor.get_network_security_groups(sub_id),
         "route_tables": ingestor.get_route_tables(sub_id),
         "vpn": ingestor.get_vpn_inventory(sub_id),
+        "load_balancers": ingestor.get_load_balancers(sub_id, public_ips),
     }
 
 
@@ -1639,10 +2012,15 @@ class SnapshotIngestor:
         self.taken = data.get("taken", "?")
         self.version = data.get("azmap_version", "?")
         self.subs = {s["id"]: s for s in data.get("subscriptions") or []}
+        self._warned: set = set()
 
     def _part(self, sub_id: str, key: str, empty: Any) -> Any:
         # Deep-copied: scan() annotates what it's given, and a snapshot from
         # an older azmap may lack a part a newer one records.
+        if key not in self.subs[sub_id] and key not in self._warned:
+            self._warned.add(key)
+            note(f"This snapshot predates azmap recording {key.replace('_', ' ')}; "
+                 f"export a new one to see them.")
         return copy.deepcopy(self.subs[sub_id].get(key, empty))
 
     def get_subscriptions(self):
@@ -1666,6 +2044,9 @@ class SnapshotIngestor:
 
     def get_vpn_inventory(self, sub_id):
         return self._part(sub_id, "vpn", {"gateways": [], "local_gateways": [], "connections": []})
+
+    def get_load_balancers(self, sub_id, public_ips=None):
+        return self._part(sub_id, "load_balancers", [])
 
 
 def run_export(args) -> int:
@@ -1717,6 +2098,7 @@ def run_export(args) -> int:
         "gateways": sum(len(r["vpn"]["gateways"]) for r in recorded),
         "local gateways": sum(len(r["vpn"]["local_gateways"]) for r in recorded),
         "connections": sum(len(r["vpn"]["connections"]) for r in recorded),
+        "load balancers": sum(len(r["load_balancers"]) for r in recorded),
     }
     note(f"Wrote {path}: " + ", ".join(f"{n} {k}" for k, n in counts.items()))
     return 0
@@ -1726,7 +2108,7 @@ def run_export(args) -> int:
 
 NOUNS = {"vms": "VMs", "nics": "NICs", "nsgs": "NSGs", "subnets": "subnets",
          "gateways": "gateways", "local-gateways": "local gateways",
-         "connections": "connections"}
+         "connections": "connections", "lbs": "load balancers"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1779,7 +2161,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="azmap",
-        description="Query VMs, NICs, NSGs, subnets and VPN gateways with the web app's Azure identity.",
+        description="Query VMs, NICs, NSGs, subnets, VPN gateways and load balancers "
+                    "with the web app's Azure identity.",
         epilog="Example: azmap vms --port 3389 --from internet --access allow",
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
@@ -1844,6 +2227,19 @@ def build_parser() -> argparse.ArgumentParser:
         sub.add_argument("--detail", action="store_true",
                          help="every setting of each, below the table (as -o yaml has)")
 
+    lbs = commands.add_parser(
+        "lbs", aliases=["load-balancers"], parents=[common],
+        help="load balancers, internal and external: frontends, pools, rules, probes, NAT",
+    )
+    lbs.add_argument("--type", type=str.lower, choices=["internal", "external", "gateway"])
+    lbs.add_argument("--vm", action="append", metavar="GLOB", help="VM (or IP) in a backend pool")
+    lbs.add_argument("--frontend", action="append", metavar="GLOB",
+                     help="frontend IP address, public IP name or frontend name")
+    lbs.add_argument("--unused", action="store_true", help="backend pools are empty")
+    lbs.add_argument("--detail", action="store_true",
+                     help="frontends, pools, rules, probes, NAT and outbound rules of each, "
+                          "below the table; with -o csv, a row per rule")
+
     export = commands.add_parser(
         "export", help="save everything to one YAML snapshot, readable later with --file",
     )
@@ -1863,13 +2259,16 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    kind = args.command
+    kind = "lbs" if args.command == "load-balancers" else args.command
     if kind == "export":
         logging.basicConfig(level=logging.WARNING)
         return run_export(args)
     if args.file and getattr(args, "effective", False):
         parser.error("--effective asks Azure for live rules; a snapshot holds the "
                      "rules as written, which --rules shows")
+    if kind == "lbs" and (args.source or args.access or args.direction or args.defaults):
+        parser.error("load balancers take --port and --proto (what a rule listens on); "
+                     "--from, --access, --direction and --defaults are for NSG rules")
     if args.direction is None:
         args.direction = "in" if rule_filter_active(args) else "any"
     # A rule filter on VMs or NICs is a question about rules; show the answer.

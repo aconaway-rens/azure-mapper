@@ -439,6 +439,8 @@ class AzureResourceIngestor:
                 nics.append({
                     "id": nic.id,
                     "name": nic.name,
+                    # Load balancer pools name their members by ip-config.
+                    "ip_configuration": ip_config.name,
                     "subnet_id": ip_config.subnet.id.lower(),
                     "private_ip": ip_config.private_ip_address,
                     "public_ip": self._public_ip_of(
@@ -469,6 +471,10 @@ class AzureResourceIngestor:
         A backend pool member is an *ipConfiguration* ID; the NIC is its parent
         resource, so the ID is trimmed back to the NIC before it can be matched
         against anything else in the scan.
+
+        ``properties`` carries every setting as ARM names it (frontends, pools,
+        rules, probes, NAT and outbound rules), keys sorted, for the CLI and
+        for snapshots; the other keys are what the web app's map draws from.
         """
         network_client = NetworkManagementClient(
             self.credential, subscription_id
@@ -477,6 +483,7 @@ class AzureResourceIngestor:
         balancers = []
 
         for lb in network_client.load_balancers.list_all():
+            raw = lb.as_dict()
             frontends = []
             for frontend in lb.frontend_ip_configurations or []:
                 subnet = getattr(frontend, "subnet", None)
@@ -502,7 +509,10 @@ class AzureResourceIngestor:
                 "name": lb.name,
                 "resource_group": lb.id.split("/")[4],
                 "location": lb.location,
-                "sku": lb.sku.name if getattr(lb, "sku", None) else "",
+                "sku": self._enum_name(lb.sku.name) if getattr(lb, "sku", None) else "",
+                "tier": self._enum_name(lb.sku.tier) if getattr(lb, "sku", None) else "",
+                "tags": raw.get("tags") or {},
+                "properties": _without_secrets(raw.get("properties") or {}),
                 "frontends": frontends,
                 "backend_nic_ids": sorted(backend_nic_ids),
                 "rule_count": len(lb.load_balancing_rules or []),
